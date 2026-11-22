@@ -170,10 +170,10 @@ try {
 
 /* ★ 悬浮窗音乐列表：把你的歌曲外链放进来（mp3 直链），App 会随机播放 */
 const MUSIC_LIST = [
-  // 示例（公共CDN测试曲，可换成你自己的链接）：
-  { name: '夜空中最亮的星', url: 'https://m801.music.126.net/obj/40325817719/6817598349/b35e/b238fd9c9e73d2e2a1a27bc0a0965c4b.mp3' },
-  { name: '晴天', url: 'https://m801.music.126.net/obj/40325817719/6817598349/b35e/b238fd9c9e73d2e2a1a27bc0a0965c4b.mp3' },
-  { name: '示例音乐3', url: 'https://m801.music.126.net/obj/40325817719/6817598349/b35e/b238fd9c9e73d2e2a1a27bc0a0965c4b.mp3' },
+  { name: '放松时刻', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3' },
+  { name: '午后阳光', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3' },
+  { name: '晚风轻抚', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-8.mp3' },
+  { name: 'Kalimba', url: 'https://www.learningcontainer.com/wp-content/uploads/2020/02/Kalimba.mp3' },
 ];
 const MUSIC_ENABLED = true; // 后台可关
 
@@ -310,12 +310,19 @@ const server = http.createServer((req, res) => {
       if (err) return send(res, 413, { ok: false, msg: '文件太大（上限 10MB）' });
       const part = extractMultipartFile(buf, req.headers['content-type'] || '');
       if (!part) return send(res, 400, { ok: false, msg: '上传格式错误' });
-      if (!/\.(png|jpe?g|gif|webp)$/i.test(part.filename))
-        return send(res, 400, { ok: false, msg: '只能上传图片' });
-      const name = Date.now().toString(36) + crypto.randomBytes(4).toString('hex') + path.extname(part.filename).toLowerCase();
+      // 后缀：优先用文件名里的；没有就用 Content-Type 猜；还不行就当 jpg
+      let ext = (path.extname(part.filename || '') || '').toLowerCase();
+      if (!/^\.(png|jpe?g|gif|webp)$/.test(ext)) {
+        const ct = (part.contentType || '').toLowerCase();
+        if (ct.includes('png')) ext = '.png';
+        else if (ct.includes('gif')) ext = '.gif';
+        else if (ct.includes('webp')) ext = '.webp';
+        else ext = '.jpg';
+      }
+      const name = Date.now().toString(36) + crypto.randomBytes(4).toString('hex') + ext;
       fs.mkdirSync(UPLOAD_DIR, { recursive: true });
       fs.writeFileSync(path.join(UPLOAD_DIR, name), part.body);
-      console.log('[上传]', name, part.body.length, 'bytes');
+      console.log('[上传]', name, part.body.length, 'bytes', part.filename);
       return send(res, 200, { ok: true, msg: '上传成功', data: { url: '/files/' + name } });
     }, 10 * 1024 * 1024);
   }
@@ -874,7 +881,8 @@ function extractMultipartFile(buf, contentType) {
       const headers = part.slice(0, headEnd).toString('utf8');
       const body = part.slice(headEnd + 4);
       const fn = /filename="([^"]*)"/.exec(headers);
-      if (fn) return { filename: fn[1], body };
+      const ct = /Content-Type:\s*([^\r\n]+)/i.exec(headers);
+      if (fn) return { filename: fn[1], body, contentType: ct ? ct[1].trim() : '' };
     }
     pos = next;
   }
