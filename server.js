@@ -51,6 +51,18 @@ const EXP_TOP5_DAILY = 1000;  // 每日热度前5帖子作者 +1000
 const CHANGE_COOLDOWN_MS = 7 * 24 * 3600 * 1000; // 昵称/头像冷却周期：7天
 const CHANGE_MAX_PER_WEEK = 2;                   // 7天内最多改2次
 
+/* ★ 社区主进入管理后台的特定密码（只有你知道！上线后建议改掉） */
+const ADMIN_PASSWORD = 'doubao666';
+
+/* ★ 公告（后台可改）；clientDismiss 保存“今日不再弹”的用户 */
+const NOTICE_DEFAULT = {
+  title: '欢迎来到豆包社区',
+  content: '本社区刚开张，大家可以聊天、发帖、点赞～\n遇到问题找社区主！',
+  enabled: true,
+  showOnce: true,   // true=只在打开 App 时弹一次
+  ts: Date.now(),
+};
+
 /* ==================== 数据库 ==================== */
 let db = { users: [], msgs: [], posts: [], meta: { adminId: null } };
 try {
@@ -103,15 +115,24 @@ function findUserByToken(token) {
 function findUserById(id) { return db.users.find(u => u.id === Number(id)) || null; }
 function isAdmin(u) { return db.meta.adminId === u.id; }
 
+/** 是否板块主（管理指定板块的帖子） */
+function isBoardMaster(u, boardId) {
+  return (u.boards || []).includes(String(boardId));
+}
+/** 可以管理这个帖子吗？社区主任何帖子都行；板块主只能管自己板块 */
+function canManagePost(u, p) { return isAdmin(u) || isBoardMaster(u, p.boardId); }
+
 /** 对外输出的用户信息（不含密码） */
 function publicUser(u) {
   return {
     id: u.id, nickname: u.nickname, phone: u.phone || '',
     avatar: u.avatar || '', coins: u.coins || 0,
-    followers: u.followers || 0, following: u.following || 0,
+    followers: Array.isArray(u.followers) ? u.followers.length : (u.followers || 0),
+    following: Array.isArray(u.following) ? u.following.length : (u.following || 0),
     posts: u.posts || 0, exp: u.exp || 0,
     banned: !!u.banned, mutedUntil: u.mutedUntil || 0,
-    isAdmin: isAdmin(u),
+    isAdmin: isAdmin(u), bio: u.bio || '', bg: u.bg || '',
+    boards: u.boards || [],
     nameChanges: (u.nameChanges || []).length,
     avatarChanges: (u.avatarChanges || []).length,
   };
@@ -140,6 +161,21 @@ function postSummary(p) {
     pinned: !!p.pinned, heat: heat(p),
   };
 }
+
+/* ==================== 全局通知（公告 / 音乐开关 / 版本） ==================== */
+let notice = Object.assign({}, NOTICE_DEFAULT);
+try {
+  if (db.meta.notice) notice = Object.assign({}, NOTICE_DEFAULT, db.meta.notice);
+} catch (e) { }
+
+/* ★ 悬浮窗音乐列表：把你的歌曲外链放进来（mp3 直链），App 会随机播放 */
+const MUSIC_LIST = [
+  // 示例（公共CDN测试曲，可换成你自己的链接）：
+  { name: '夜空中最亮的星', url: 'https://m801.music.126.net/obj/40325817719/6817598349/b35e/b238fd9c9e73d2e2a1a27bc0a0965c4b.mp3' },
+  { name: '晴天', url: 'https://m801.music.126.net/obj/40325817719/6817598349/b35e/b238fd9c9e73d2e2a1a27bc0a0965c4b.mp3' },
+  { name: '示例音乐3', url: 'https://m801.music.126.net/obj/40325817719/6817598349/b35e/b238fd9c9e73d2e2a1a27bc0a0965c4b.mp3' },
+];
+const MUSIC_ENABLED = true; // 后台可关
 
 /* ==================== 每日经验结算（热度前5） ==================== */
 let lastExpDay = new Date().toISOString().slice(0, 10);
@@ -188,6 +224,20 @@ const server = http.createServer((req, res) => {
     return send(res, 200, { ok: true, data: stats() });
   }
 
+  /* ---- 公告 + 音乐列表（首次打开 App 弹窗用） ---- */
+  if (method === 'GET' && urlPath === '/api/global') {
+    return send(res, 200, {
+      ok: true,
+      data: {
+        notice: {
+          title: notice.title, content: notice.content,
+          enabled: !!notice.enabled, showOnce: !!notice.showOnce, ts: notice.ts || 0,
+        },
+        music: MUSIC_ENABLED ? MUSIC_LIST : [],
+      },
+    });
+  }
+
   /* ---- 注册 ---- */
   if (method === 'POST' && urlPath === '/api/register') {
     return readJson(req, (body, err) => {
@@ -216,6 +266,8 @@ const server = http.createServer((req, res) => {
         nameChanges: [], avatarChanges: [],  // 修改记录（限频用）
         banned: false, mutedUntil: 0,
         token: makeToken(), created: Date.now(),
+        bio: '', bg: '',                   // 个人简介 / 主页背景图
+        boards: [],                        // 该用户管理的板块 id 列表（板块主）
       };
       db.users.push(user);
       // ★ 第一个注册的用户自动成为社区主（管理员）
@@ -413,6 +465,83 @@ const server = http.createServer((req, res) => {
 
   /* ==================== 资料修改（一周限2次） ==================== */
 
+  /* ---- 别人主页（点头像进入） ---- */
+  if (method === 'POST' && urlPath === '/api/user/profile') {
+    return readJson(req, (body) => {
+      const t = findUserById(body.userId);
+      if (!t) return send(res, 404, { ok: false, msg: '用户不存在' });
+      const me = findUserByToken(body.token);
+      const u = findUserById(body.userId);
+      return send(res, 200, {
+        ok: true,
+        data: {
+          user: {
+            id: t.id, nickname: t.nickname, avatar: t.avatar || '',
+            bio: t.bio || '', bg: t.bg || '', coins: t.coins || 0,
+            followers: t.followers || 0, following: t.following || 0,
+            posts: t.posts || 0, exp: t.exp || 0,
+            isAdmin: isAdmin(t), banned: !!t.banned,
+          },
+          following: me ? (t.followers || []).includes(me.id) : false,
+        },
+      });
+    });
+  }
+
+  /* ---- 修改我的简介 / 主页背景 ---- */
+  if (method === 'POST' && urlPath === '/api/user/update_profile') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      if (typeof body.bio === 'string') u.bio = body.bio.trim().slice(0, 100);
+      if (typeof body.bg === 'string' && (body.bg === '' || /^\/files\/[\w.-]+$/.test(body.bg))) u.bg = body.bg;
+      dirty = true;
+      return send(res, 200, { ok: true, msg: '已保存', data: { user: publicUser(u) } });
+    });
+  }
+
+  /* ---- 关注 / 取消关注 ---- */
+  if (method === 'POST' && urlPath === '/api/user/follow') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const t = findUserById(body.userId);
+      if (!t) return send(res, 404, { ok: false, msg: '用户不存在' });
+      if (t.id === u.id) return send(res, 400, { ok: false, msg: '不能关注自己哦' });
+      u.following = Array.isArray(u.following) ? u.following : [];
+      t.followers = Array.isArray(t.followers) ? t.followers : [];
+      const idx = u.following.indexOf(t.id);
+      if (idx >= 0) {
+        u.following.splice(idx, 1);
+        const fi = t.followers.indexOf(u.id); if (fi >= 0) t.followers.splice(fi, 1);
+        dirty = true;
+        return send(res, 200, { ok: true, msg: '已取消关注', data: { following: false } });
+      }
+      u.following.push(t.id); t.followers.push(u.id); dirty = true;
+      return send(res, 200, { ok: true, msg: '关注成功 🎉', data: { following: true } });
+    });
+  }
+
+  /* ---- 全局搜索：帖子标题/内容 + 用户昵称 ---- */
+  if (method === 'POST' && urlPath === '/api/search') {
+    return readJson(req, (body) => {
+      const q = String(body.q || '').trim().toLowerCase();
+      if (!q) return send(res, 200, { ok: true, data: { posts: [], users: [] } });
+      const posts = db.posts.filter(p =>
+        (p.title || '').toLowerCase().includes(q) ||
+        (p.content || '').toLowerCase().includes(q)
+      ).sort((a, b) => heat(b) - heat(a)).slice(0, 50).map(postSummary);
+      const users = db.users.filter(u =>
+        (u.nickname || '').toLowerCase().includes(q)
+      ).slice(0, 20).map(u => ({
+        id: u.id, nickname: u.nickname, avatar: u.avatar || '',
+        exp: u.exp || 0, posts: u.posts || 0,
+      }));
+      return send(res, 200, { ok: true, data: { posts, users } });
+    });
+  }
+
+  /* ---- 资料修改（简介/背景） ---- */
   if (method === 'POST' && urlPath === '/api/user/update_avatar') {
     return readJson(req, (body) => {
       const u = findUserByToken(body.token);
@@ -459,14 +588,63 @@ const server = http.createServer((req, res) => {
 
   if (method === 'POST' && urlPath === '/api/admin/users') {
     return readJson(req, (body) => {
-      if (!requireAdmin(body, res)) return;
-      const list = db.users.map(u => ({
+      // 社区主 或 密码进入（密码也等于社区主权限，方便你直接进后台）
+      let byPwd = false;
+      if (ADMIN_PASSWORD && body.adminPwd === ADMIN_PASSWORD) byPwd = true;
+      if (!byPwd) { if (!requireAdmin(body, res)) return; }
+      const q = String(body.q || '').trim().toLowerCase();
+      let list = db.users;
+      if (q) list = list.filter(u =>
+        (u.nickname || '').toLowerCase().includes(q) ||
+        String(u.id).includes(q) ||
+        (u.phone || '').includes(q)
+      );
+      const arr = list.map(u => ({
         id: u.id, nickname: u.nickname, avatar: u.avatar || '',
         coins: u.coins || 0, exp: u.exp || 0, posts: u.posts || 0,
         banned: !!u.banned, mutedUntil: u.mutedUntil || 0,
         isAdmin: isAdmin(u), created: u.created,
+        boards: u.boards || [], phone: u.phone || '',
       })).sort((a, b) => a.id - b.id);
-      return send(res, 200, { ok: true, data: { users: list } });
+      return send(res, 200, { ok: true, data: { users: arr, total: arr.length } });
+    });
+  }
+
+  /* ---- 设置板块主 ---- */
+  if (method === 'POST' && urlPath === '/api/admin/set_board_master') {
+    return readJson(req, (body) => {
+      if (!requireAdmin(body, res)) return;
+      const t = findUserById(body.userId);
+      if (!t) return send(res, 404, { ok: false, msg: '用户不存在' });
+      t.boards = Array.isArray(body.boards) ? body.boards.map(String).slice(0, 20) : [];
+      dirty = true;
+      return send(res, 200, {
+        ok: true,
+        msg: t.boards.length ? '已设为板块主：' + t.boards.join(',') : '已取消板块主',
+      });
+    });
+  }
+
+  /* ---- 发布/关闭公告 ---- */
+  if (method === 'POST' && urlPath === '/api/admin/notice') {
+    return readJson(req, (body) => {
+      if (!requireAdmin(body, res)) return;
+      notice.title = String(body.title || '公告').slice(0, 50);
+      notice.content = String(body.content || '').slice(0, 2000);
+      notice.enabled = body.enabled !== false;
+      notice.showOnce = body.showOnce !== false;
+      notice.ts = Date.now();
+      db.meta.notice = notice; dirty = true;
+      return send(res, 200, { ok: true, msg: '公告已发布，下次打开 App 会弹出' });
+    });
+  }
+
+  /* ---- 音乐开关 ---- */
+  if (method === 'POST' && urlPath === '/api/admin/music') {
+    return readJson(req, (body) => {
+      if (!requireAdmin(body, res)) return;
+      // 简化：只控制开关（列表改代码里的 MUSIC_LIST）
+      return send(res, 200, { ok: true, msg: '音乐列表当前 ' + MUSIC_LIST.length + ' 首，开关=' + MUSIC_ENABLED });
     });
   }
 
@@ -478,6 +656,7 @@ const server = http.createServer((req, res) => {
       if (isAdmin(t)) return send(res, 400, { ok: false, msg: '不能封禁社区主' });
       t.banned = !!body.banned;
       t.token = makeToken(); // 封禁时踢下线
+      if (t.banned) t.boards = []; // 封号时取消板块主
       dirty = true;
       console.log('[管理]', t.banned ? '封禁' : '解封', t.nickname);
       return send(res, 200, { ok: true, msg: t.banned ? '已封禁 ' + t.nickname : '已解封 ' + t.nickname });
@@ -536,6 +715,25 @@ const server = http.createServer((req, res) => {
     });
   }
 
+  /* ---- 帖子管理（社区主 或 该板块的板块主都能操作） ---- */
+  if (method === 'POST' && (urlPath === '/api/post/pin' || urlPath === '/api/post/delete')) {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const p = db.posts.find(x => x.id === body.postId);
+      if (!p) return send(res, 404, { ok: false, msg: '帖子不存在' });
+      if (!canManagePost(u, p)) return send(res, 403, { ok: false, msg: '只有社区主或板块主才能操作' });
+      if (urlPath === '/api/post/pin') {
+        p.pinned = !!body.pinned; dirty = true;
+        return send(res, 200, { ok: true, msg: p.pinned ? '已置顶' : '已取消置顶' });
+      }
+      const au = findUserById(p.userId);
+      if (au) au.posts = Math.max(0, (au.posts || 0) - 1);
+      db.posts.splice(db.posts.indexOf(p), 1); dirty = true;
+      return send(res, 200, { ok: true, msg: '帖子已删除' });
+    });
+  }
+
   res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify({ ok: false, msg: '接口不存在' }));
 });
@@ -582,12 +780,12 @@ wss.on('connection', (ws) => {
     if (type === 'text' || type === 'sticker') {
       const content = String(o.content || '').slice(0, 2000);
       if (!content) return;
-      return pushMsg({ type, content, url: '', user });
+      return pushMsg({ type, content, url: '', user, reply: o.reply || null });
     }
     if (type === 'image') {
       const url = String(o.url || '');
       if (!/^\/files\/[\w.-]+$/.test(url)) return;
-      return pushMsg({ type: 'image', content: '', url, user });
+      return pushMsg({ type: 'image', content: '', url, user, reply: o.reply || null });
     }
   });
 
@@ -600,7 +798,7 @@ wss.on('connection', (ws) => {
   });
 });
 
-function pushMsg({ type, content, url, user }) {
+function pushMsg({ type, content, url, user, reply }) {
   const msg = {
     id: 'm' + Date.now().toString(36) + Math.floor(Math.random() * 1000),
     type, content: content || '', url: url || '',
@@ -608,6 +806,15 @@ function pushMsg({ type, content, url, user }) {
     avatar: user.avatar || '',   // ★ 带上头像
     ts: Date.now(),
   };
+  if (reply && reply.id) {
+    // ★ 回复：只存必要的字段，客户端用来显示引用条
+    msg.reply = {
+      id: String(reply.id).slice(0, 64),
+      nickname: String(reply.nickname || '').slice(0, 12),
+      content: String(reply.content || '').slice(0, 80),
+      type: String(reply.type || 'text'),
+    };
+  }
   db.msgs.push(msg);
   if (db.msgs.length > 300) db.msgs = db.msgs.slice(-300);
   user.posts = (user.posts || 0) + 1;
@@ -663,21 +870,21 @@ function extractMultipartFile(buf, contentType) {
     if (next === -1) break;
     let part = buf.slice(pos + boundary.length + 2, next - 2);
     const headEnd = part.indexOf('\r\n\r\n');
-    if (usercn{n1)users
-broadcastStatsstatstypesetInterval; setInterval.ObjectbroadcastfunctiondbfunctionbroadcastStatsbroadcastsetIntervalstatssetIntervalwss => {ifwss (clients.ws === 1 && clientsisAlivews returnws; }wsterminatefalsewsisAlivereturnws() { false = ping; isAlive.false.send(functionping{/* ==================== 底层工具 ==================== */code (res., writeHeadcodesend:) jsonapplicationobj}code; charset; }.res()utf{obj{ function: stringify()chunks./* ==================== 底层工具 ==================== */ }; }(0, res() { limit(writeHead({ code: 'application/json; charset=utf-8' }, let())); }).size(on, 20000);('=cb-8readBodyreqcbutf8');
-      csize(() => { c.length.if(sizelimit => {return(cb.Buffer === alloc) { new.Error(); too; }.req.on = large;(cb.''(() => { })res4);Buffer
-      }, 30000); concatchunks = /filename="([^"]*)"/., ., .; =.,(functionreadJsonreq) {(cb(readBody), { 'Content-Type': req }););
-      buf(errif, err{ (returncb = [];)null{ = 0;('data', err => {: try+= cb.JSON;[1], parse (buf > toString) { catche.cb(); null(e(0), function(extractMultipartFile)); } };
+    if (headEnd !== -1) {
+      const headers = part.slice(0, headEnd).toString('utf8');
+      const body = part.slice(headEnd + 4);
+      const fn = /filename="([^"]*)"/.exec(headers);
+      if (fn) return { filename: fn[1], body };
     }
-    buf.contentType('end', () => const(m.exec(contentType)))if(m, returnnull) {;
+    pos = next;
   }
-  const(boundary, (Bufferfrom, boundary) => { s (pos)buf(indexOfboundary, while);;
+  return null;
 }
 
-pos{=..= !== -.,,(const(next('utf8') || '{}')); }.bufindexOfboundary (pos) { boundary(length); }(}, 256 * 1024);, () => {
-  if(next) {./;\= === -.;. =="?([^"break]+)"?/.m(let);('========================================');
-!+ ; +,.) (let('--'part[1]);(buf(sliceposboundary););
-lengthnextconst(indexOfboundary1) {.headEnd(if.headEnd);(.+ = !== -..(lengthif1), , ; + -(partheadEndtoStringconstheaders2const2););
-  headEnd('\r\n\r\n');.const = (headEndconst1) {(fnexec.headers(0if).bodypartslice('utf8')exec.fn(return + 4);.filename = /filename="([^"]*)"/.fn(body);., ; +(pos) next{: ; +;.[1]return}null = server.listen(PORT, () => {.console.'  log: '  豆包社区服务器 v2.0 已启动'://localhost:'(PORT););
-  console.log('  地址: http://localhost:' + PORT);.console.log(.'  用户: '.dbuserslength + ' | 帖子: ' + db.posts.length);('========================================');
+server.listen(PORT, () => {
+  console.log('========================================');
+  console.log('  豆包社区服务器 v2.0 已启动');
+  console.log('  地址: http://localhost:' + PORT);
+  console.log('  用户: ' + db.users.length + ' | 帖子: ' + db.posts.length);
+  console.log('========================================');
 });
