@@ -1,0 +1,10 @@
+# Render 免费部署配置（一键部署用）
+# 部署方法看同目录《部署教程.md》
+services:
+  - type: web
+    name: doubao-community
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /api/stats
