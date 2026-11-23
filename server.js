@@ -1870,8 +1870,8 @@ wss.on('connection', (ws) => {
 
     if (type === 'auth') {
       const u = findUserByToken(o.token);
-      if (!u) { ws.send(JSON.stringify({ type: 'error', msg: '登录已失效，请重新登录' })); return ws.close(4001, 'unauthorized'); }
-      if (u.banned) { ws.send(JSON.stringify({ type: 'error', msg: '该账号已被封禁' })); return ws.close(4003, 'banned'); }
+      if (!u) { ws.send(JSON.stringify({ type: 'error', msg: '登录已失效，请重新登录' })); setTimeout(() => ws.close(4001, 'unauthorized'), 120); return; }
+      if (u.banned) { ws.send(JSON.stringify({ type: 'error', msg: '该账号已被封禁' })); setTimeout(() => ws.close(4003, 'banned'), 120); return; }
       ws.user = u;
       ws.send(JSON.stringify(Object.assign({ type: 'auth_ok', me: publicUser(u) }, stats())));
       ws.send(JSON.stringify({ type: 'history', msgs: db.msgs.slice(-200) }));
