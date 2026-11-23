@@ -1870,8 +1870,8 @@ wss.on('connection', (ws) => {
 
     if (type === 'auth') {
       const u = findUserByToken(o.token);
-      if (!u) return ws.send(JSON.stringify({ type: 'error', msg: '登录已失效，请重新登录' }));
-      if (u.banned) return ws.send(JSON.stringify({ type: 'error', msg: '该账号已被封禁' }));
+      if (!u) { ws.send(JSON.stringify({ type: 'error', msg: '登录已失效，请重新登录' })); return ws.close(4001, 'unauthorized'); }
+      if (u.banned) { ws.send(JSON.stringify({ type: 'error', msg: '该账号已被封禁' })); return ws.close(4003, 'banned'); }
       ws.user = u;
       ws.send(JSON.stringify(Object.assign({ type: 'auth_ok', me: publicUser(u) }, stats())));
       ws.send(JSON.stringify({ type: 'history', msgs: db.msgs.slice(-200) }));
@@ -1880,7 +1880,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    if (!ws.user) return ws.send(JSON.stringify({ type: 'error', msg: '请先登录' }));
+    if (!ws.user) { ws.send(JSON.stringify({ type: 'error', msg: '请先登录' })); return ws.close(4001, 'unauthorized'); }
     const user = ws.user;
 
     // 禁言校验（聊天室）
