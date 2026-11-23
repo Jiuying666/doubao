@@ -124,6 +124,8 @@ if (db.users.length > 0 && !db.users.some(u => u.id === 100001)) {
   if (!u.equipped || typeof u.equipped !== 'object') u.equipped = {};
   if (typeof u.nameColor !== 'string') u.nameColor = '';
   if (!Array.isArray(u.signDays)) u.signDays = [];
+  if (typeof u.popularity !== 'number') u.popularity = 0;   // ★ 人气值（收礼物增加）
+  if (!u.giftStats || typeof u.giftStats !== 'object') u.giftStats = {}; // ★ 收到的礼物聚合
 });
 if (!db.meta.pending || typeof db.meta.pending !== 'object') db.meta.pending = {};
 if (!Array.isArray(db.moments)) db.moments = [];   // ★ v3 社区动态
@@ -291,6 +293,21 @@ function countUserPosts(userId) {
 }
 
 /** 对外输出的用户信息（不含密码） */
+/** 收到的礼物聚合（数组，按数量降序） */
+function giftStatsOf(u) {
+  const stats = (u && u.giftStats) || {};
+  return Object.keys(stats).map(id => {
+    const g = stats[id] || {};
+    return { id, name: g.name || '', emoji: g.emoji || '', price: g.price || 0,
+      popularity: g.popularity || 0, count: g.count || 0 };
+  }).sort((a, b) => b.count - a.count);
+}
+
+/** 收到礼物总件数 */
+function giftCountOf(u) {
+  return giftStatsOf(u).reduce((s, g) => s + g.count, 0);
+}
+
 function publicUser(u) {
   return {
     id: u.id, nickname: u.nickname, phone: u.phone || '',
@@ -310,6 +327,9 @@ function publicUser(u) {
     checkinMonth: u.checkins ? Object.keys(u.checkins).filter(d => d.startsWith(new Date().toISOString().slice(0, 7))).length : 0,
     nameChanges: (u.nameChanges || []).length,
     avatarChanges: (u.avatarChanges || []).length,
+    popularity: u.popularity || 0,    // ★ 人气值
+    giftCount: giftCountOf(u),
+    gifts: giftStatsOf(u),
   };
 }
 
@@ -384,6 +404,17 @@ const SHOP_ITEMS = [
   { id: 'title_food', name: '干饭第一名', desc: '社区最会吃的干饭王', type: 'title', value: '干饭第一名', price: 1800, color: 0xFFFFB020 },
   { id: 'title_light', name: '社区之光', desc: '限量大头衔，走在社区最前面', type: 'title', value: '社区之光', price: 5000, color: 0xFFFF5F9E },
   { id: 'title_boss', name: '豆包股东', desc: '最贵头衔，纯纯排面', type: 'title', value: '豆包股东', price: 8000, color: 0xFFFF5C6C },
+];
+
+/* ============ 礼物目录（价格便宜到贵；price=豆包币，popularity=增加的人气值，tier=特效等级） ============ */
+const GIFT_ITEMS = [
+  { id: 'candy',  name: '糖果', emoji: '🍬', price: 5,   popularity: 1,   tier: 1 },
+  { id: 'rose',   name: '玫瑰', emoji: '🌹', price: 20,  popularity: 3,   tier: 1 },
+  { id: 'beer',   name: '啤酒', emoji: '🍺', price: 40,  popularity: 6,   tier: 1 },
+  { id: 'bear',   name: '玩偶', emoji: '🧸', price: 80,  popularity: 12,  tier: 2 },
+  { id: 'cake',   name: '蛋糕', emoji: '🎂', price: 150, popularity: 22,  tier: 2 },
+  { id: 'rocket', name: '火箭', emoji: '🚀', price: 300, popularity: 45,  tier: 3 },
+  { id: 'crown',  name: '皇冠', emoji: '👑', price: 888, popularity: 100, tier: 3 },
 ];
 
 /** 给用户加一条通知（每人最多保留 200 条，最新的在前） */
@@ -925,6 +956,7 @@ const server = http.createServer((req, res) => {
             posts: visiblePosts.length, exp: t.exp || 0,
             isAdmin: isAdmin(t), banned: !!t.banned,
             title: t.title || '', listVisible: !!t.listVisible,
+            popularity: t.popularity || 0, giftCount: giftCountOf(t), gifts: giftStatsOf(t),
           },
           following: me ? (t.followers || []).includes(me.id) : false,
           posts: myPosts,
@@ -1293,6 +1325,22 @@ const server = http.createServer((req, res) => {
     });
   }
 
+  if (method === 'POST' && urlPath === '/api/admin/reset_password') {
+    return readJson(req, (body) => {
+      if (!requireAdmin(body, res)) return;
+      const t = findUserById(body.userId);
+      if (!t) return send(res, 404, { ok: false, msg: '用户不存在' });
+      const newPwd = String(body.newPassword || '');
+      if (newPwd.length < 6)
+        return send(res, 400, { ok: false, msg: '新密码至少 6 位' });
+      t.pass = hashPassword(newPwd);
+      t.token = makeToken(); // 强制对方用新密码重新登录
+      dirty = true;
+      console.log('[管理] 重置', t.nickname, 'ID:' + t.id, '密码');
+      return send(res, 200, { ok: true, msg: '已重置 ' + t.nickname + ' 的密码，把新密码告知对方即可' });
+    });
+  }
+
   if (method === 'POST' && urlPath === '/api/admin/pin') {
     return readJson(req, (body) => {
       if (!requireAdmin(body, res)) return;
@@ -1566,12 +1614,43 @@ const server = http.createServer((req, res) => {
         id: u.id, nickname: u.nickname, avatar: u.avatar || '',
         exp: u.exp || 0, posts: countUserPosts(u.id),
         followers: Array.isArray(u.followers) ? u.followers.length : (u.followers || 0),
+        popularity: u.popularity || 0,
         isAdmin: isAdmin(u),
       });
       const list = db.users.filter(u => !u.banned).map(pick)
         .sort((a, b) => (b[type] || 0) - (a[type] || 0))
         .slice(0, 20);
       return send(res, 200, { ok: true, data: { list, type } });
+    });
+  }
+
+  /* ---- 礼物 ---- */
+  if (method === 'POST' && urlPath === '/api/gift/list') {
+    return send(res, 200, { ok: true, data: { items: GIFT_ITEMS } });
+  }
+
+  if (method === 'POST' && urlPath === '/api/gift/send') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const t = findUserById(body.toUserId);
+      if (!t) return send(res, 404, { ok: false, msg: '用户不存在' });
+      if (t.id === u.id) return send(res, 400, { ok: false, msg: '不能给自己送礼物哦' });
+      const g = GIFT_ITEMS.find(x => x.id === body.giftId);
+      if (!g) return send(res, 400, { ok: false, msg: '礼物不存在' });
+      if ((u.coins || 0) < g.price)
+        return send(res, 400, { ok: false, msg: '豆包币不够啦，还差 ' + (g.price - (u.coins || 0)) + ' 个' });
+      u.coins -= g.price;
+      t.popularity = (t.popularity || 0) + g.popularity;
+      t.giftStats = t.giftStats || {};
+      const stat = t.giftStats[g.id] || { name: g.name, emoji: g.emoji, price: g.price, popularity: g.popularity, count: 0 };
+      stat.count += 1;
+      t.giftStats[g.id] = stat;
+      notify(t.id, 'gift', '收到礼物', u.nickname + ' 送了你 ' + g.emoji + ' ' + g.name, u, '');
+      dirty = true;
+      console.log('[礼物]', u.nickname, '→', t.nickname, g.emoji, g.name);
+      return send(res, 200, { ok: true, msg: '已送出 ' + g.emoji + ' ' + g.name,
+        data: { coins: u.coins, popularity: t.popularity, giftCount: giftCountOf(t), gifts: giftStatsOf(t) } });
     });
   }
 
