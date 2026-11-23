@@ -1035,6 +1035,25 @@ const server = http.createServer((req, res) => {
     });
   }
 
+  if (method === 'POST' && urlPath === '/api/user/update_password') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效，请重新登录' });
+      const oldPwd = String(body.oldPassword || '');
+      const newPwd = String(body.newPassword || '');
+      if (u.pass !== hashPassword(oldPwd))
+        return send(res, 400, { ok: false, msg: '当前密码不正确' });
+      if (newPwd.length < 6)
+        return send(res, 400, { ok: false, msg: '新密码至少 6 位' });
+      if (newPwd === oldPwd)
+        return send(res, 400, { ok: false, msg: '新密码不能和当前密码一样' });
+      u.pass = hashPassword(newPwd);
+      dirty = true;
+      console.log('[改密]', u.nickname, 'ID:' + u.id, '已修改密码');
+      return send(res, 200, { ok: true, msg: '密码已更新，下次登录用新密码', data: { user: publicUser(u) } });
+    });
+  }
+
   /* ==================== 管理后台（仅社区主） ==================== */
 
   function requireAdmin(body, res) {
