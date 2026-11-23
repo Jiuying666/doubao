@@ -81,6 +81,26 @@ if (!db.meta.adminId && db.users.length > 0) {
   console.log('[社区主] 已将最早注册的用户 ID:' + db.meta.adminId + ' 设为社区主');
 }
 
+// ★ 社区主 ID 固定 100001：如果库里还没人用 100001，就把最早注册的人改成 100001
+//   （帖子/评论/点赞/关注里的旧 ID 会一起同步，不会断）
+if (db.users.length > 0 && !db.users.some(u => u.id === 100001)) {
+  const first = db.users.slice().sort((a, b) => (a.created || 0) - (b.created || 0))[0];
+  const oldId = first.id;
+  first.id = 100001;
+  if (db.meta.adminId === oldId) db.meta.adminId = 100001;
+  db.posts.forEach(p => {
+    if (p.userId === oldId) p.userId = 100001;
+    if (Array.isArray(p.likes)) p.likes = p.likes.map(x => (x === oldId ? 100001 : x));
+    if (Array.isArray(p.comments)) p.comments.forEach(c => { if (c.userId === oldId) c.userId = 100001; });
+  });
+  db.users.forEach(u => {
+    if (Array.isArray(u.following)) u.following = u.following.map(x => (x === oldId ? 100001 : x));
+    if (Array.isArray(u.followers)) u.followers = u.followers.map(x => (x === oldId ? 100001 : x));
+  });
+  dirty = true;
+  console.log('[迁移] 已把最早注册的用户', first.nickname, 'ID从', oldId, '改为 100001');
+}
+
 function saveDb() {
   if (!dirty) return;
   try {
@@ -99,11 +119,13 @@ function sha256(s) { return crypto.createHash('sha256').update(String(s)).digest
 function hashPassword(p) { return sha256('doubao-salt-2026::' + p); }
 function makeToken() { return crypto.randomBytes(24).toString('hex'); }
 
-/** 随机用户ID：6位数（100000~999999），不重复 */
+/** 随机用户ID：6位数（100000~999999），不重复；第一个注册的用户固定 100001 */
 function nextUserId() {
+  // ★ 社区主永远是 100001
+  if (db.users.length === 0) return 100001;
   for (let i = 0; i < 999; i++) {
     const id = 100000 + Math.floor(Math.random() * 900000);
-    if (!db.users.some(u => u.id === id)) return id;
+    if (id !== 100001 && !db.users.some(u => u.id === id)) return id;
   }
   return Date.now() % 900000 + 100000;
 }
@@ -257,7 +279,7 @@ const server = http.createServer((req, res) => {
         return send(res, 400, { ok: false, msg: '这个手机号已注册过' });
 
       const user = {
-        id: nextUserId(),          // ★ 随机ID
+        id: nextUserId(),          // ★ 第一个注册=100001，后面随机6位
         nickname, phone,
         pass: hashPassword(password),
         coins: 100, followers: 0, following: 0, posts: 0,
@@ -478,7 +500,10 @@ const server = http.createServer((req, res) => {
       const t = findUserById(body.userId);
       if (!t) return send(res, 404, { ok: false, msg: '用户不存在' });
       const me = findUserByToken(body.token);
-      const u = findUserById(body.userId);
+      // TA 发过的帖子（最新的在前，最多 20 条）
+      const myPosts = db.posts.filter(p => p.userId === t.id)
+        .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.ts - a.ts)
+        .slice(0, 20).map(postSummary);
       return send(res, 200, {
         ok: true,
         data: {
@@ -490,6 +515,7 @@ const server = http.createServer((req, res) => {
             isAdmin: isAdmin(t), banned: !!t.banned,
           },
           following: me ? (t.followers || []).includes(me.id) : false,
+          posts: myPosts,
         },
       });
     });
