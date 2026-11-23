@@ -117,8 +117,16 @@ if (db.users.length > 0 && !db.users.some(u => u.id === 100001)) {
   if (!Array.isArray(u.pendingPosts)) u.pendingPosts = [];      // 兼容旧字段
   if (!Array.isArray(u.boards)) u.boards = [];
   if (!u.checkins || typeof u.checkins !== 'object') u.checkins = {}; // 签到记录
+  // ★ v3 新增字段
+  if (!Array.isArray(u.notifications)) u.notifications = [];
+  if (!Array.isArray(u.favorites)) u.favorites = [];
+  if (!Array.isArray(u.ownedItems)) u.ownedItems = [];
+  if (!u.equipped || typeof u.equipped !== 'object') u.equipped = {};
+  if (typeof u.nameColor !== 'string') u.nameColor = '';
+  if (!Array.isArray(u.signDays)) u.signDays = [];
 });
 if (!db.meta.pending || typeof db.meta.pending !== 'object') db.meta.pending = {};
+if (!Array.isArray(db.moments)) db.moments = [];   // ★ v3 社区动态
 if (typeof db.meta.musicEnabled !== 'boolean') db.meta.musicEnabled = true;
 // 老帖子补 pending=false（以前发的都算已审核）
 db.posts.forEach(p => { if (typeof p.pending !== 'boolean') p.pending = false; });
@@ -262,6 +270,9 @@ function publicUser(u) {
     isAdmin: isAdmin(u), bio: u.bio || '', bg: u.bg || '',
     boards: u.boards || [],
     title: u.title || '',            // ★ 自定义头衔（社区主授予；空=用等级名）
+    nameColor: u.nameColor || '',     // ★ v3 名字颜色（商城道具，预留）
+    collects: Array.isArray(u.favorites) ? u.favorites.length : 0,
+    signStreak: calcStreak(u),        // ★ v3 连续签到天数
     listVisible: !!u.listVisible,    // ★ 粉丝/关注列表是否对别人公开
     checkinToday: !!(u.checkins && u.checkins[new Date().toISOString().slice(0, 10)]),
     checkinMonth: u.checkins ? Object.keys(u.checkins).filter(d => d.startsWith(new Date().toISOString().slice(0, 7))).length : 0,
@@ -280,7 +291,7 @@ function changesInWeek(arr) {
 function heat(p) { return (p.views || 0) + (p.likes || []).length * 5 + (p.comments || []).length * 10; }
 
 /** 帖子摘要（列表用） */
-function postSummary(p) {
+function postSummary(p, viewer) {
   const u = findUserById(p.userId);
   return {
     id: p.id, boardId: p.boardId, title: p.title,
@@ -293,9 +304,115 @@ function postSummary(p) {
     boards: u ? (u.boards || []) : [],
     ts: p.ts, views: p.views || 0,
     likes: (p.likes || []).length, comments: (p.comments || []).length,
+    collects: (p.collects || []).length, shares: p.shares || 0,
+    boardName: boardNameOf(p.boardId),
+    likedByMe: (viewer && viewer.id) ? (p.likes || []).includes(viewer.id) : false,
+    collectedByMe: (viewer && viewer.id) ? (p.collects || []).includes(viewer.id) : false,
     pinned: !!p.pinned, heat: heat(p),
     pending: !!p.pending,
   };
+}
+
+
+/* ============================================================
+ * ★ v3.0 新增能力：通知 / 动态 / 收藏 / 商城 / 排行榜 / 壁纸
+ * ============================================================ */
+
+/** 壁纸库：启动页随机抽一张（想换壁纸就改这里，加 https 直链即可） */
+const WALLPAPERS = [
+  'https://t.alcy.cc/ycy',
+  'https://api.dujin.org/bing/1920.php',
+  'https://api.paugram.com/wallpaper/',
+  'https://www.dmoe.cc/random.php',
+  'https://api.btstu.cn/sjbz/api.php?lx=dongman&format=images',
+  'https://api.vvhan.com/api/wallpaper/views',
+  'https://loliapi.com/acg/pe',
+  'https://picsum.photos/1080/1920?random=11',
+  'https://picsum.photos/1080/1920?random=23',
+  'https://picsum.photos/1080/1920?random=37',
+  'https://picsum.photos/1080/1920?random=51',
+  'https://picsum.photos/1080/1920?random=68',
+];
+
+/** 板块名（帖子列表要给客户端显示中文板块名） */
+const BOARD_NAMES = {
+  gg: 'GG修改器', andlua: 'AndLua', ai: 'AI 大模型',
+  chat: '闲聊灌水', share: '资源分享', dev: '开发交流',
+};
+function boardNameOf(id) { return BOARD_NAMES[id] || (id ? String(id) : '综合'); }
+
+/** 商城商品：想加商品照着写。type=title 头衔（会真正生效） / bg 背景标识 / name_color 名字颜色 */
+const SHOP_ITEMS = [
+  { id: 'title_chi', name: '吃瓜群众', desc: '存在感很强的头衔，聊天时挂在名字后面', type: 'title', value: '吃瓜群众', price: 200, color: 0xFF6E5BFF },
+  { id: 'title_fox', name: '小狐狸', desc: '软乎乎的头衔，适合卖萌', type: 'title', value: '小狐狸', price: 300, color: 0xFFFF8A5B },
+  { id: 'title_dev', name: '技术大佬', desc: '发教程、答疑专用头衔', type: 'title', value: '技术大佬', price: 800, color: 0xFF38BDF8 },
+  { id: 'title_creator', name: '内容创作者', desc: '持续输出好内容的人', type: 'title', value: '内容创作者', price: 1200, color: 0xFF22C7A9 },
+  { id: 'title_night', name: '夜猫子', desc: '凌晨三点还在线的证明', type: 'title', value: '夜猫子', price: 1500, color: 0xFF8E6FF7 },
+  { id: 'title_food', name: '干饭第一名', desc: '社区最会吃的干饭王', type: 'title', value: '干饭第一名', price: 1800, color: 0xFFFFB020 },
+  { id: 'title_light', name: '社区之光', desc: '限量大头衔，走在社区最前面', type: 'title', value: '社区之光', price: 5000, color: 0xFFFF5F9E },
+  { id: 'title_boss', name: '豆包股东', desc: '最贵头衔，纯纯排面', type: 'title', value: '豆包股东', price: 8000, color: 0xFFFF5C6C },
+];
+
+/** 给用户加一条通知（每人最多保留 200 条，最新的在前） */
+function notify(toUserId, type, title, text, fromUser, postId) {
+  const target = findUserById(toUserId);
+  if (!target) return;
+  if (fromUser && target.id === fromUser.id) return;   // 自己操作自己不提醒
+  target.notifications = Array.isArray(target.notifications) ? target.notifications : [];
+  target.notifications.unshift({
+    id: 'n' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    type: String(type || 'sys'),
+    title: String(title || '').slice(0, 40),
+    text: String(text || '').slice(0, 120),
+    postId: postId || '',
+    fromId: fromUser ? fromUser.id : 0,
+    fromName: fromUser ? fromUser.nickname : '',
+    fromAvatar: fromUser ? (fromUser.avatar || '') : '',
+    ts: Date.now(),
+    read: false,
+  });
+  if (target.notifications.length > 200) target.notifications.length = 200;
+  dirty = true;
+}
+
+/** 连续签到天数（今天没签就从昨天往前算） */
+function calcStreak(u) {
+  const ck = (u && u.checkins) ? u.checkins : {};
+  let day = Date.now();
+  const todayKey = new Date(day).toISOString().slice(0, 10);
+  if (!ck[todayKey]) day -= 86400000;
+  let streak = 0;
+  for (let i = 0; i < 400; i++) {
+    const key = new Date(day - i * 86400000).toISOString().slice(0, 10);
+    if (ck[key]) streak++; else break;
+  }
+  return streak;
+}
+
+/** 动态摘要（朋友圈式） */
+function momentSummary(m, viewer) {
+  return {
+    id: m.id, userId: m.userId, nickname: m.nickname,
+    avatar: m.avatar || '', text: m.text || '', images: m.images || [],
+    ts: m.ts, likes: (m.likes || []).length,
+    likedByMe: viewer ? (m.likes || []).includes(viewer.id) : false,
+    commentCount: (m.comments || []).length,
+    comments: (m.comments || []).slice(-3).map(c => ({
+      nickname: c.nickname, content: c.content, ts: c.ts,
+    })),
+  };
+}
+
+/** 求某个商品是否已被当前用户使用 */
+function itemEquipped(u, item) {
+  const eq = u.equipped || {};
+  return eq[item.type] === item.id;
+}
+
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
 }
 
 /* ==================== 全局通知（公告 / 音乐开关 / 版本） ==================== */
@@ -375,7 +492,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(`<!doctype html><html><head><meta charset="utf-8"><title>豆包社区服务器</title></head>
 <body style="font-family:sans-serif;max-width:560px;margin:60px auto;color:#1F2430">
-  <h1>豆包 🫛 服务器运行中 (v2.3)</h1>
+  <h1>豆包 🫛 服务器运行中 (v3.0)</h1>
   <p>✅ 服务正常 | 在线 <b>${authedClients()}</b> | 用户 <b>${db.users.length}</b> | 消息 <b>${db.msgs.length}</b> | 帖子 <b>${db.posts.length}</b></p>
 </body></html>`);
     return;
@@ -483,6 +600,10 @@ const server = http.createServer((req, res) => {
         return send(res, 400, { ok: false, msg: '今天已经签过啦，明天再来' });
       u.checkins[today] = true;
       u.exp = (u.exp || 0) + EXP_CHECKIN;
+      u.coins = (u.coins || 0) + 10;              // ★ v3：签到也发 10 豆包币
+      u.signDays = Array.isArray(u.signDays) ? u.signDays : [];
+      u.signDays.push(today);
+      if (u.signDays.length > 90) u.signDays = u.signDays.slice(-90);
       let extra = 0;
       // 当月天数：按 UTC 月份（ISO 字符串同款）
       const ym = today.slice(0, 7);
@@ -493,6 +614,14 @@ const server = http.createServer((req, res) => {
         extra = EXP_CHECKIN_MONTH_FULL;
         u.exp += extra;
       }
+      // ★ v3：连签满 7 天额外 +100 豆包币
+      const streakNow = calcStreak(u);
+      let bonusCoin = 0;
+      if (streakNow > 0 && streakNow % 7 === 0) {
+        bonusCoin = 100;
+        u.coins = (u.coins || 0) + bonusCoin;
+      }
+      u.signStreak = streakNow;
       dirty = true;
       console.log('[签到]', u.nickname, today, '+', EXP_CHECKIN, extra ? ('月满+' + extra) : '');
       return send(res, 200, {
@@ -500,7 +629,7 @@ const server = http.createServer((req, res) => {
         msg: extra > 0
           ? ('签到成功，经验 +' + EXP_CHECKIN + '，本月全勤再 +' + extra + '！')
           : ('签到成功，经验 +' + EXP_CHECKIN),
-        data: { user: publicUser(u), extra },
+        data: { user: publicUser(u), extra, streak: calcStreak(u), bonusCoin },
       });
     });
   }
@@ -620,7 +749,14 @@ const server = http.createServer((req, res) => {
             images: p.images || [], userId: p.userId, nickname: p.nickname,
             avatar: p.avatar || '', exp: u ? u.exp || 0 : 0, ts: p.ts,
             views: p.views, likes: (p.likes || []).length,
+            collects: (p.collects || []).length, shares: p.shares || 0,
+            boardName: boardNameOf(p.boardId),
             likedByMe: me ? (p.likes || []).includes(me.id) : false,
+            collectedByMe: me ? (p.collects || []).includes(me.id) : false,
+            followingAuthor: (me && u) ? (u.followers || []).includes(me.id) : false,
+            authorTitle: u ? (u.title || '') : '',
+            isAdmin: u ? isAdmin(u) : false,
+            boards: u ? (u.boards || []) : [],
             comments: (p.comments || []).map(c => ({
               id: c.id, userId: c.userId, nickname: c.nickname,
               avatar: c.avatar || '', exp: (() => { const cu = findUserById(c.userId); return cu ? cu.exp || 0 : 0; })(),
@@ -645,6 +781,8 @@ const server = http.createServer((req, res) => {
       if (idx >= 0) { p.likes.splice(idx, 1); dirty = true; return send(res, 200, { ok: true, msg: '已取消点赞', data: { liked: false, likes: p.likes.length } }); }
       p.likes.push(u.id);
       dirty = true;
+      notify(p.userId, 'like', '收到一个赞',
+        u.nickname + ' 赞了你的帖子《' + (p.title || '') + '》', u, p.id);
       return send(res, 200, { ok: true, msg: '点赞成功', data: { liked: true, likes: p.likes.length } });
     });
   }
@@ -667,6 +805,8 @@ const server = http.createServer((req, res) => {
         userId: u.id, nickname: u.nickname, avatar: u.avatar || '',
         content, ts: Date.now(),
       });
+      notify(p.userId, 'comment', '收到一条评论',
+        u.nickname + ' 评论了《' + (p.title || '') + '》：' + content.slice(0, 40), u, p.id);
       // ★ 评论≥15字 +10 经验
       if (content.length >= 15) u.exp = (u.exp || 0) + EXP_COMMENT;
       dirty = true;
@@ -755,6 +895,7 @@ const server = http.createServer((req, res) => {
         return send(res, 200, { ok: true, msg: '已取消关注', data: { following: false } });
       }
       u.following.push(t.id); t.followers.push(u.id); dirty = true;
+      notify(t.id, 'follow', '新的关注', u.nickname + ' 关注了你', u);
       return send(res, 200, { ok: true, msg: '关注成功 🎉', data: { following: true } });
     });
   }
@@ -774,7 +915,11 @@ const server = http.createServer((req, res) => {
         id: u.id, nickname: u.nickname, avatar: u.avatar || '',
         exp: u.exp || 0, posts: u.posts || 0,
       }));
-      return send(res, 200, { ok: true, data: { posts, users } });
+      const me = findUserByToken(body.token);
+      const moments = (db.moments || []).filter(m =>
+        (m.text || '').toLowerCase().includes(q)).slice(0, 20)
+        .map(m => momentSummary(m, me));
+      return send(res, 200, { ok: true, data: { posts, users, moments } });
     });
   }
 
@@ -913,12 +1058,23 @@ const server = http.createServer((req, res) => {
       if (!p) return send(res, 404, { ok: false, msg: '帖子不存在' });
       if (!canManagePost(u, p)) return send(res, 403, { ok: false, msg: '只能审核自己板块的帖子' });
       if (!p.pending) return send(res, 400, { ok: false, msg: '该帖子已经审核过了' });
-      p.pending = false;
-      // 通过才发经验/计数/热度
+      const rejected = body.pass === false;
       const author = findUserById(p.userId);
-      if (author) {
-        author.posts = (author.posts || 0) + 1;
-        author.exp = (author.exp || 0) + EXP_POST;
+      if (rejected) {
+        // 驳回：帖子删除 + 通知作者
+        const pi = db.posts.indexOf(p);
+        if (pi >= 0) db.posts.splice(pi, 1);
+        if (author) notify(author.id, 'audit', '帖子未通过审核',
+          '《' + (p.title || '') + '》被 ' + u.nickname + ' 驳回，看看是不是不符合板块规则～', u);
+      } else {
+        p.pending = false;
+        // 通过才发经验/计数/热度
+        if (author) {
+          author.posts = (author.posts || 0) + 1;
+          author.exp = (author.exp || 0) + EXP_POST;
+          notify(author.id, 'audit', '帖子审核通过',
+            '《' + (p.title || '') + '》已通过审核，+20 经验，大家可以看到啦 🎉', u, p.id);
+        }
       }
       // 审核人：板块主/社区主 +30 经验
       u.exp = (u.exp || 0) + EXP_AUDIT;
@@ -1089,6 +1245,332 @@ const server = http.createServer((req, res) => {
     });
   }
 
+
+  /* ============================================================
+   * ★ v3.0 新增接口
+   * ============================================================ */
+
+  /* ---- 启动页随机壁纸库 ---- */
+  if (method === 'GET' && urlPath === '/api/wallpapers') {
+    return send(res, 200, { ok: true, data: { list: WALLPAPERS } });
+  }
+
+  /* ---- 帖子分享落地页（复制链接给别人打开的网页） ---- */
+  if (method === 'GET' && urlPath.startsWith('/p/')) {
+    const sp = db.posts.find(x => x.id === urlPath.slice(3));
+    if (!sp || sp.pending) {
+      res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end('<h3>帖子不存在或还在审核中</h3>');
+    }
+    const sa = findUserById(sp.userId);
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(`<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(sp.title)} - 豆包社区</title></head>
+<body style="font-family:-apple-system,sans-serif;max-width:640px;margin:0 auto;padding:24px;color:#15171F;background:#F4F5FA">
+<div style="background:#fff;border-radius:18px;padding:20px">
+<h2 style="margin:0 0 6px">${escapeHtml(sp.title)}</h2>
+<p style="color:#8B90A3;font-size:13px;margin:0 0 16px">
+  ${escapeHtml(sp.nickname)} · ${boardNameOf(sp.boardId)} · ${new Date(sp.ts).toLocaleString('zh-CN')}</p>
+<div style="white-space:pre-wrap;line-height:1.7;font-size:15px">${escapeHtml(sp.content)}</div>
+<p style="margin-top:24px;color:#6E5BFF;font-weight:600">打开「豆包社区」App 参与讨论 →</p>
+</div></body></html>`);
+  }
+
+  /* ---- 广场：热门帖子流 ---- */
+  if (method === 'POST' && urlPath === '/api/feed') {
+    return readJson(req, (body) => {
+      const me = findUserByToken(body.token);
+      const posts = db.posts.filter(p => !p.pending)
+        .sort((a, b) => heat(b) - heat(a)).slice(0, 6)
+        .map(p => postSummary(p, me));
+      return send(res, 200, { ok: true, data: { posts } });
+    });
+  }
+
+  /* ---- 通知中心 ---- */
+  if (method === 'POST' && urlPath === '/api/notifications/list') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const all = Array.isArray(u.notifications) ? u.notifications : [];
+      const list = all.slice(0, 100);
+      return send(res, 200, {
+        ok: true,
+        data: { list, unread: all.filter(n => !n.read).length },
+      });
+    });
+  }
+  if (method === 'POST' && urlPath === '/api/notifications/unread') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const all = Array.isArray(u.notifications) ? u.notifications : [];
+      return send(res, 200, { ok: true, data: { unread: all.filter(n => !n.read).length } });
+    });
+  }
+  if (method === 'POST' && urlPath === '/api/notifications/read') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const all = Array.isArray(u.notifications) ? u.notifications : [];
+      if (body.all) all.forEach(n => { n.read = true; });
+      else if (body.id) { const n = all.find(x => x.id === body.id); if (n) n.read = true; }
+      dirty = true;
+      return send(res, 200, { ok: true, data: { unread: all.filter(n => !n.read).length } });
+    });
+  }
+
+  /* ---- 收藏 ---- */
+  if (method === 'POST' && urlPath === '/api/post/collect') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const p = db.posts.find(x => x.id === body.id);
+      if (!p) return send(res, 404, { ok: false, msg: '帖子不存在' });
+      p.collects = Array.isArray(p.collects) ? p.collects : [];
+      u.favorites = Array.isArray(u.favorites) ? u.favorites : [];
+      const i = p.collects.indexOf(u.id);
+      if (i >= 0) {
+        p.collects.splice(i, 1);
+        u.favorites = u.favorites.filter(x => x !== p.id);
+        dirty = true;
+        return send(res, 200, { ok: true, msg: '已取消收藏', data: { collected: false, collects: p.collects.length } });
+      }
+      p.collects.push(u.id);
+      if (!u.favorites.includes(p.id)) u.favorites.push(p.id);
+      dirty = true;
+      notify(p.userId, 'collect', '有人收藏了你的帖子',
+        u.nickname + ' 收藏了《' + (p.title || '') + '》', u, p.id);
+      return send(res, 200, { ok: true, msg: '已收藏 ⭐', data: { collected: true, collects: p.collects.length } });
+    });
+  }
+
+  /* ---- 分享计数 ---- */
+  if (method === 'POST' && urlPath === '/api/post/share') {
+    return readJson(req, (body) => {
+      const p = db.posts.find(x => x.id === body.id);
+      if (!p) return send(res, 404, { ok: false, msg: '帖子不存在' });
+      p.shares = (p.shares || 0) + 1;
+      dirty = true;
+      return send(res, 200, { ok: true, msg: '链接已复制', data: { shares: p.shares } });
+    });
+  }
+
+  /* ---- 我的收藏 ---- */
+  if (method === 'POST' && urlPath === '/api/my/favorites') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const ids = Array.isArray(u.favorites) ? u.favorites : [];
+      const posts = ids.map(id => db.posts.find(p => p.id === id))
+        .filter(Boolean).filter(p => !p.pending)
+        .sort((a, b) => b.ts - a.ts).slice(0, 100)
+        .map(p => postSummary(p, u));
+      return send(res, 200, { ok: true, data: { posts } });
+    });
+  }
+
+  /* ---- 我的帖子 ---- */
+  if (method === 'POST' && urlPath === '/api/my/posts') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const posts = db.posts.filter(p => p.userId === u.id)
+        .sort((a, b) => b.ts - a.ts).slice(0, 100)
+        .map(p => postSummary(p, u));
+      return send(res, 200, { ok: true, data: { posts } });
+    });
+  }
+
+  /* ---- 社区动态（朋友圈式） ---- */
+  if (method === 'POST' && urlPath === '/api/moment/list') {
+    return readJson(req, (body) => {
+      const me = findUserByToken(body.token);
+      const moments = (db.moments || []).slice(0, 50).map(m => momentSummary(m, me));
+      return send(res, 200, { ok: true, data: { moments } });
+    });
+  }
+  if (method === 'POST' && urlPath === '/api/moment/create') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      if (u.banned) return send(res, 403, { ok: false, msg: '你已被封禁' });
+      if ((u.mutedUntil || 0) > Date.now())
+        return send(res, 403, { ok: false, msg: '你正在禁言中，暂时不能发动态' });
+      const text = String(body.text || '').trim().slice(0, 500);
+      const images = Array.isArray(body.images)
+        ? body.images.filter(x => /^\/files\/[\w.-]+$/.test(x)).slice(0, 3) : [];
+      if (!text && images.length === 0)
+        return send(res, 400, { ok: false, msg: '写点什么或者配张图吧' });
+      const m = {
+        id: 'mo' + Date.now().toString(36) + crypto.randomBytes(2).toString('hex'),
+        userId: u.id, nickname: u.nickname, avatar: u.avatar || '',
+        text, images, ts: Date.now(), likes: [], comments: [],
+      };
+      db.moments.unshift(m);
+      if (db.moments.length > 500) db.moments = db.moments.slice(0, 500);
+      dirty = true;
+      return send(res, 200, { ok: true, msg: '动态已发布', data: { id: m.id } });
+    });
+  }
+  if (method === 'POST' && urlPath === '/api/moment/like') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const m = (db.moments || []).find(x => x.id === body.id);
+      if (!m) return send(res, 404, { ok: false, msg: '动态不存在' });
+      m.likes = Array.isArray(m.likes) ? m.likes : [];
+      const i = m.likes.indexOf(u.id);
+      if (i >= 0) {
+        m.likes.splice(i, 1);
+        dirty = true;
+        return send(res, 200, { ok: true, data: { liked: false, likes: m.likes.length } });
+      }
+      m.likes.push(u.id);
+      dirty = true;
+      notify(m.userId, 'like', '动态被点赞', u.nickname + ' 赞了你的动态', u);
+      return send(res, 200, { ok: true, data: { liked: true, likes: m.likes.length } });
+    });
+  }
+  if (method === 'POST' && urlPath === '/api/moment/comment') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const m = (db.moments || []).find(x => x.id === body.id);
+      if (!m) return send(res, 404, { ok: false, msg: '动态不存在' });
+      const content = String(body.content || '').trim().slice(0, 300);
+      if (!content) return send(res, 400, { ok: false, msg: '评论不能为空' });
+      m.comments = Array.isArray(m.comments) ? m.comments : [];
+      m.comments.push({ userId: u.id, nickname: u.nickname, content, ts: Date.now() });
+      dirty = true;
+      notify(m.userId, 'comment', '动态收到评论', u.nickname + '：' + content.slice(0, 40), u);
+      return send(res, 200, { ok: true, msg: '评论成功', data: { commentCount: m.comments.length } });
+    });
+  }
+  if (method === 'POST' && urlPath === '/api/moment/delete') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const i = (db.moments || []).findIndex(x => x.id === body.id);
+      if (i < 0) return send(res, 404, { ok: false, msg: '动态不存在' });
+      const m = db.moments[i];
+      if (m.userId !== u.id && !isAdmin(u))
+        return send(res, 403, { ok: false, msg: '只能删自己的动态' });
+      db.moments.splice(i, 1);
+      dirty = true;
+      return send(res, 200, { ok: true, msg: '动态已删除' });
+    });
+  }
+
+  /* ---- 排行榜 ---- */
+  if (method === 'POST' && urlPath === '/api/rank') {
+    return readJson(req, (body) => {
+      const type = String(body.type || 'exp');
+      const pick = (u) => ({
+        id: u.id, nickname: u.nickname, avatar: u.avatar || '',
+        exp: u.exp || 0, posts: u.posts || 0,
+        followers: Array.isArray(u.followers) ? u.followers.length : (u.followers || 0),
+        isAdmin: isAdmin(u),
+      });
+      const list = db.users.filter(u => !u.banned).map(pick)
+        .sort((a, b) => (b[type] || 0) - (a[type] || 0))
+        .slice(0, 20);
+      return send(res, 200, { ok: true, data: { list, type } });
+    });
+  }
+
+  /* ---- 豆包币商城 ---- */
+  if (method === 'POST' && urlPath === '/api/shop/list') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const owned = Array.isArray(u.ownedItems) ? u.ownedItems : [];
+      const items = SHOP_ITEMS.map(it => ({
+        id: it.id, name: it.name, desc: it.desc, type: it.type,
+        value: it.value, price: it.price, color: it.color,
+        owned: owned.includes(it.id),
+        equipped: itemEquipped(u, it),
+      }));
+      return send(res, 200, { ok: true, data: { coins: u.coins || 0, items } });
+    });
+  }
+  if (method === 'POST' && urlPath === '/api/shop/buy') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const item = SHOP_ITEMS.find(x => x.id === body.itemId);
+      if (!item) return send(res, 404, { ok: false, msg: '商品不存在' });
+      u.ownedItems = Array.isArray(u.ownedItems) ? u.ownedItems : [];
+      if (u.ownedItems.includes(item.id))
+        return send(res, 400, { ok: false, msg: '你已经有这个了，直接使用就行' });
+      if ((u.coins || 0) < item.price)
+        return send(res, 400, { ok: false, msg: '豆包币不够啦，还差 ' + (item.price - (u.coins || 0)) + ' 个' });
+      u.coins -= item.price;
+      u.ownedItems.push(item.id);
+      dirty = true;
+      return send(res, 200, { ok: true, msg: '兑换成功！点「使用」就能换上', data: { coins: u.coins } });
+    });
+  }
+  if (method === 'POST' && urlPath === '/api/shop/equip') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const item = SHOP_ITEMS.find(x => x.id === body.itemId);
+      if (!item) return send(res, 404, { ok: false, msg: '商品不存在' });
+      u.ownedItems = Array.isArray(u.ownedItems) ? u.ownedItems : [];
+      if (!u.ownedItems.includes(item.id))
+        return send(res, 400, { ok: false, msg: '还没有这个道具，先去兑换吧' });
+      u.equipped = (u.equipped && typeof u.equipped === 'object') ? u.equipped : {};
+      if (u.equipped[item.type] === item.id) {
+        delete u.equipped[item.type];
+        if (item.type === 'title') u.title = '';
+        dirty = true;
+        return send(res, 200, { ok: true, msg: '已取下「' + item.name + '」' });
+      }
+      u.equipped[item.type] = item.id;
+      if (item.type === 'title') u.title = String(item.value || item.name).slice(0, TITLE_MAX);
+      if (item.type === 'name_color') u.nameColor = item.value;
+      dirty = true;
+      return send(res, 200, { ok: true, msg: '已换上「' + item.name + '」', data: { user: publicUser(u) } });
+    });
+  }
+
+  /* ---- 签到日历 ---- */
+  if (method === 'POST' && urlPath === '/api/checkin/calendar') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const month = /^\d{4}-\d{2}$/.test(String(body.month || ''))
+        ? String(body.month) : new Date().toISOString().slice(0, 7);
+      const ck = u.checkins || {};
+      const days = Object.keys(ck).filter(d => d.startsWith(month))
+        .map(d => Number(d.slice(8, 10))).sort((a, b) => a - b);
+      const today = new Date().toISOString().slice(0, 10);
+      return send(res, 200, {
+        ok: true,
+        data: {
+          days, month,
+          streak: calcStreak(u),
+          signedToday: !!ck[today],
+          total: days.length,
+        },
+      });
+    });
+  }
+
+  /* ---- 设置社区主 ---- */
+  if (method === 'POST' && urlPath === '/api/admin/set_admin') {
+    return readJson(req, (body) => {
+      if (!requireAdmin(body, res)) return;
+      const t = findUserById(body.userId);
+      if (!t) return send(res, 404, { ok: false, msg: '用户不存在' });
+      db.meta.adminId = t.id;
+      dirty = true;
+      return send(res, 200, { ok: true, msg: t.nickname + ' 已成为社区主' });
+    });
+  }
+
   res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify({ ok: false, msg: '接口不存在' }));
 });
@@ -1143,6 +1625,22 @@ wss.on('connection', (ws) => {
       // ★ 图文混合：content 是配文（可空）
       const content = String(o.content || '').trim().slice(0, 500);
       return pushMsg({ type: 'image', content, url, user, reply: o.reply || null });
+    }
+
+    /* ★ v3：撤回消息（2 分钟内，只能撤回自己的） */
+    if (type === 'recall') {
+      const id = String(o.id || '');
+      const idx = db.msgs.findIndex(m => m.id === id);
+      if (idx < 0) return ws.send(JSON.stringify({ type: 'error', msg: '这条消息太旧了，撤不回来' }));
+      const m = db.msgs[idx];
+      if (m.userId !== user.id) return ws.send(JSON.stringify({ type: 'error', msg: '只能撤回自己的消息' }));
+      if (Date.now() - m.ts > 2 * 60 * 1000)
+        return ws.send(JSON.stringify({ type: 'error', msg: '超过 2 分钟就不能撤回啦' }));
+      m.recalled = true;
+      m.content = '';
+      m.url = '';
+      dirty = true;
+      return broadcast({ type: 'recall', id: m.id });
     }
   });
 
@@ -1242,7 +1740,7 @@ function extractMultipartFile(buf, contentType) {
 
 server.listen(PORT, () => {
   console.log('========================================');
-  console.log('  豆包社区服务器 v2.3 已启动');
+  console.log('  豆包社区服务器 v3.0 已启动');
   console.log('  地址: http://localhost:' + PORT);
   console.log('  用户: ' + db.users.length + ' | 帖子: ' + db.posts.length);
   console.log('========================================');

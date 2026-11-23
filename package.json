@@ -1,6 +1,6 @@
 {
   "name": "doubao-community-server",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "description": "豆包社区后端服务器（注册/登录/聊天室/在线人数/图片上传）",
   "main": "server.js",
   "scripts": {
