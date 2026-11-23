@@ -54,6 +54,11 @@ const CHANGE_MAX_PER_WEEK = 2;                   // 7天内最多改2次
 /* ★ 社区主进入管理后台的特定密码（只有你知道！上线后建议改掉） */
 const ADMIN_PASSWORD = 'doubao666';
 
+/* 审核通过给板块主加的经验 */
+const EXP_AUDIT = 30;
+/* 头衔最长字数 */
+const TITLE_MAX = 8;
+
 /* ★ 公告（后台可改）；clientDismiss 保存“今日不再弹”的用户 */
 const NOTICE_DEFAULT = {
   title: '欢迎来到豆包社区',
@@ -64,7 +69,7 @@ const NOTICE_DEFAULT = {
 };
 
 /* ==================== 数据库 ==================== */
-let db = { users: [], msgs: [], posts: [], meta: { adminId: null } };
+let db = { users: [], msgs: [], posts: [], meta: { adminId: null, pending: {} } };
 try {
   const parsed = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
   if (Array.isArray(parsed.users)) db.users = parsed.users;
@@ -100,6 +105,19 @@ if (db.users.length > 0 && !db.users.some(u => u.id === 100001)) {
   dirty = true;
   console.log('[迁移] 已把最早注册的用户', first.nickname, 'ID从', oldId, '改为 100001');
 }
+
+// 老数据补字段：自定义头衔 / 关注粉丝是否公开 / 待审核帖子队列
+// ★ 这样更新代码重启，老用户的头衔、关注、帖子都不会丢
+ db.users.forEach(u => {
+  if (typeof u.title !== 'string') u.title = '';
+  if (typeof u.listVisible !== 'boolean') u.listVisible = false; // 默认别人不能看粉丝/关注列表
+  if (!Array.isArray(u.pendingPosts)) u.pendingPosts = [];      // 兼容旧字段
+  if (!Array.isArray(u.boards)) u.boards = [];
+});
+if (!db.meta.pending || typeof db.meta.pending !== 'object') db.meta.pending = {};
+if (typeof db.meta.musicEnabled !== 'boolean') db.meta.musicEnabled = true;
+// 老帖子补 pending=false（以前发的都算已审核）
+db.posts.forEach(p => { if (typeof p.pending !== 'boolean') p.pending = false; });
 
 function saveDb() {
   if (!dirty) return;
@@ -155,6 +173,8 @@ function publicUser(u) {
     banned: !!u.banned, mutedUntil: u.mutedUntil || 0,
     isAdmin: isAdmin(u), bio: u.bio || '', bg: u.bg || '',
     boards: u.boards || [],
+    title: u.title || '',            // ★ 自定义头衔（社区主授予；空=用等级名）
+    listVisible: !!u.listVisible,    // ★ 粉丝/关注列表是否对别人公开
     nameChanges: (u.nameChanges || []).length,
     avatarChanges: (u.avatarChanges || []).length,
   };
@@ -178,9 +198,13 @@ function postSummary(p) {
     imageCount: (p.images || []).length, firstImage: (p.images || [])[0] || '',
     userId: p.userId, nickname: p.nickname, avatar: p.avatar || '',
     exp: u ? u.exp || 0 : 0,
+    authorTitle: u ? u.title || '' : '',
+    isAdmin: u ? isAdmin(u) : false,
+    boards: u ? (u.boards || []) : [],
     ts: p.ts, views: p.views || 0,
     likes: (p.likes || []).length, comments: (p.comments || []).length,
     pinned: !!p.pinned, heat: heat(p),
+    pending: !!p.pending,
   };
 }
 
@@ -197,7 +221,7 @@ const MUSIC_LIST = [
   { name: '晚风轻抚', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-8.mp3' },
   { name: 'Kalimba', url: 'https://www.learningcontainer.com/wp-content/uploads/2020/02/Kalimba.mp3' },
 ];
-const MUSIC_ENABLED = true; // 后台可关
+let musicEnabled = true; // 后台可开可关，存 db.meta.musicEnabled，重启不丢
 
 /* ==================== 每日经验结算（热度前5） ==================== */
 let lastExpDay = new Date().toISOString().slice(0, 10);
@@ -236,7 +260,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(`<!doctype html><html><head><meta charset="utf-8"><title>豆包社区服务器</title></head>
 <body style="font-family:sans-serif;max-width:560px;margin:60px auto;color:#1F2430">
-  <h1>豆包 🫛 服务器运行中 (v2.0)</h1>
+  <h1>豆包 🫛 服务器运行中 (v2.3)</h1>
   <p>✅ 服务正常 | 在线 <b>${authedClients()}</b> | 用户 <b>${db.users.length}</b> | 消息 <b>${db.msgs.length}</b> | 帖子 <b>${db.posts.length}</b></p>
 </body></html>`);
     return;
@@ -255,7 +279,7 @@ const server = http.createServer((req, res) => {
           title: notice.title, content: notice.content,
           enabled: !!notice.enabled, showOnce: !!notice.showOnce, ts: notice.ts || 0,
         },
-        music: MUSIC_ENABLED ? MUSIC_LIST : [],
+        music: (typeof db.meta.musicEnabled === 'boolean' ? db.meta.musicEnabled : musicEnabled) ? MUSIC_LIST : [],
       },
     });
   }
@@ -290,6 +314,8 @@ const server = http.createServer((req, res) => {
         token: makeToken(), created: Date.now(),
         bio: '', bg: '',                   // 个人简介 / 主页背景图
         boards: [],                        // 该用户管理的板块 id 列表（板块主）
+        title: '',                         // 自定义头衔（社区主授予，空=显示等级名）
+        listVisible: false,                // 粉丝/关注列表默认别人不可见
       };
       db.users.push(user);
       // ★ 第一个注册的用户自动成为社区主（管理员）
@@ -306,7 +332,9 @@ const server = http.createServer((req, res) => {
       if (err) return send(res, 400, { ok: false, msg: '请求格式错误' });
       const account = String(body.account || '').trim();
       const u = db.users.find(x => x.nickname === account || (x.phone && x.phone === account));
-      if (!u || u.pass !== hashPassword(String(body.password || '')))
+      if (!u)
+        return send(res, 404, { ok: false, msg: '没有此账号，请先注册' });
+      if (u.pass !== hashPassword(String(body.password || '')))
         return send(res, 400, { ok: false, msg: '账号或密码不对' });
       if (u.banned)
         return send(res, 403, { ok: false, msg: '该账号已被封禁，如有疑问联系社区主' });
@@ -383,13 +411,16 @@ const server = http.createServer((req, res) => {
         boardId, title, content, images,
         userId: u.id, nickname: u.nickname, avatar: u.avatar || '',
         ts: Date.now(), views: 0, likes: [], comments: [], pinned: false, lastExpDay: null,
+        pending: true,          // ★ 默认进待审核区，板块主/社区主审核通过后才对大家展示
       };
       db.posts.unshift(post);
-      u.posts = (u.posts || 0) + 1;
-      u.exp = (u.exp || 0) + EXP_POST;
+      // 待审核队列（重启也不丢）
+      db.meta.pending = db.meta.pending || {};
+      db.meta.pending[boardId] = Array.isArray(db.meta.pending[boardId]) ? db.meta.pending[boardId] : [];
+      if (!db.meta.pending[boardId].includes(post.id)) db.meta.pending[boardId].unshift(post.id);
       dirty = true;
-      console.log('[发帖]', u.nickname, '→', boardId, ':', title);
-      return send(res, 200, { ok: true, msg: '发布成功', data: { post: postSummary(post) } });
+      console.log('[发帖·待审]', u.nickname, '→', boardId, ':', title);
+      return send(res, 200, { ok: true, msg: '发布成功，等待板块主审核', data: { post: postSummary(post) } });
     });
   }
 
@@ -397,7 +428,14 @@ const server = http.createServer((req, res) => {
   if (method === 'POST' && urlPath === '/api/post/list') {
     return readJson(req, (body) => {
       const boardId = String(body.boardId || '');
-      let list = db.posts.filter(p => !boardId || p.boardId === boardId);
+      const me = findUserByToken(body.token);
+      let list = db.posts.filter(p => {
+        if (boardId && p.boardId !== boardId) return false;
+        if (!p.pending) return true;
+        // 待审核帖：只有社区主/该板块板块主/作者自己能刷出来
+        if (!me) return false;
+        return me.id === p.userId || canManagePost(me, p);
+      });
       const sort = String(body.sort || 'all');
       if (sort === 'new') list.sort((a, b) => b.ts - a.ts);
       else if (sort === 'hot') list.sort((a, b) => (b.views || 0) - (a.views || 0));
@@ -415,6 +453,10 @@ const server = http.createServer((req, res) => {
     return readJson(req, (body) => {
       const p = db.posts.find(x => x.id === body.id);
       if (!p) return send(res, 404, { ok: false, msg: '帖子不存在或已被删除' });
+      const viewer = findUserByToken(body.token);
+      if (p.pending && !viewer) return send(res, 404, { ok: false, msg: '帖子审核中' });
+      if (p.pending && !(viewer.id === p.userId || canManagePost(viewer, p)))
+        return send(res, 404, { ok: false, msg: '帖子审核中' });
       p.views = (p.views || 0) + 1;
       dirty = true;
       const u = findUserById(p.userId);
@@ -500,10 +542,16 @@ const server = http.createServer((req, res) => {
       const t = findUserById(body.userId);
       if (!t) return send(res, 404, { ok: false, msg: '用户不存在' });
       const me = findUserByToken(body.token);
-      // TA 发过的帖子（最新的在前，最多 20 条）
-      const myPosts = db.posts.filter(p => p.userId === t.id)
+      const isSelf = me && me.id === t.id;
+      const canSeeList = isSelf || isAdmin(t) || !!t.listVisible; // 默认别人不可见
+      // TA 发过的帖子（最新的在前，最多 20 条；待审核的不给别人看）
+      const myPosts = db.posts.filter(p => p.userId === t.id && (!p.pending || (me && (me.id === t.id || canManagePost(me, p)))))
         .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.ts - a.ts)
         .slice(0, 20).map(postSummary);
+      const listUser = (x) => {
+        const u = findUserById(x);
+        return u ? { id: u.id, nickname: u.nickname, avatar: u.avatar || '', exp: u.exp || 0, title: u.title || '' } : null;
+      };
       return send(res, 200, {
         ok: true,
         data: {
@@ -513,9 +561,13 @@ const server = http.createServer((req, res) => {
             followers: t.followers || 0, following: t.following || 0,
             posts: t.posts || 0, exp: t.exp || 0,
             isAdmin: isAdmin(t), banned: !!t.banned,
+            title: t.title || '', listVisible: !!t.listVisible,
           },
           following: me ? (t.followers || []).includes(me.id) : false,
           posts: myPosts,
+          canSeeList,
+          followers: canSeeList ? (t.followers || []).map(listUser).filter(Boolean) : [],
+          followingList: canSeeList ? (t.following || []).map(listUser).filter(Boolean) : [],
         },
       });
     });
@@ -528,6 +580,7 @@ const server = http.createServer((req, res) => {
       if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
       if (typeof body.bio === 'string') u.bio = body.bio.trim().slice(0, 100);
       if (typeof body.bg === 'string' && (body.bg === '' || /^\/files\/[\w.-]+$/.test(body.bg))) u.bg = body.bg;
+      if (typeof body.listVisible === 'boolean') u.listVisible = body.listVisible; // 别人能否看我的粉丝/关注
       dirty = true;
       return send(res, 200, { ok: true, msg: '已保存', data: { user: publicUser(u) } });
     });
@@ -638,8 +691,114 @@ const server = http.createServer((req, res) => {
         banned: !!u.banned, mutedUntil: u.mutedUntil || 0,
         isAdmin: isAdmin(u), created: u.created,
         boards: u.boards || [], phone: u.phone || '',
+        title: u.title || '', listVisible: !!u.listVisible,
       })).sort((a, b) => a.id - b.id);
       return send(res, 200, { ok: true, data: { users: arr, total: arr.length } });
+    });
+  }
+
+
+  /* ==================== 关注列表可见开关 + 自定义头衔 + 审核 ==================== */
+
+  /* ---- 设置粉丝/关注列表是否对别人可见 ---- */
+  if (method === 'POST' && urlPath === '/api/user/list_visible') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      u.listVisible = !!body.visible;
+      dirty = true;
+      return send(res, 200, {
+        ok: true,
+        msg: u.listVisible ? '已开启：别人可以查看你的粉丝和关注' : '已关闭：别人不能查看你的粉丝和关注',
+        data: { listVisible: u.listVisible },
+      });
+    });
+  }
+
+  /* ---- 社区主授予/清除自定义头衔 ---- */
+  if (method === 'POST' && urlPath === '/api/admin/title') {
+    return readJson(req, (body) => {
+      if (!requireAdmin(body, res)) return;
+      const t = findUserById(body.userId);
+      if (!t) return send(res, 404, { ok: false, msg: '用户不存在' });
+      const title = String(body.title || '').trim().slice(0, TITLE_MAX);
+      t.title = title;
+      dirty = true;
+      return send(res, 200, {
+        ok: true,
+        msg: title ? ('已授予 ' + t.nickname + ' 头衔「' + title + '」') : ('已清除 ' + t.nickname + ' 的头衔'),
+        data: { title },
+      });
+    });
+  }
+
+  /* ---- 板块主/社区主：待审核帖子 ---- */
+  if (method === 'POST' && urlPath === '/api/admin/pending') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      if (!isAdmin(u) && (u.boards || []).length === 0)
+        return send(res, 403, { ok: false, msg: '只有社区主或板块主能审核' });
+      // 社区主=所有待审；板块主=自己板块的待审
+      let list = db.posts.filter(p => p.pending);
+      if (!isAdmin(u)) list = list.filter(p => isBoardMaster(u, p.boardId));
+      list.sort((a, b) => b.ts - a.ts);
+      return send(res, 200, {
+        ok: true,
+        data: {
+          posts: list.map(postSummary),
+          total: list.length,
+        },
+      });
+    });
+  }
+
+  /* ---- 审核：通过 / 驳回 ---- */
+  if (method === 'POST' && urlPath === '/api/admin/audit') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const p = db.posts.find(x => x.id === body.postId);
+      if (!p) return send(res, 404, { ok: false, msg: '帖子不存在' });
+      if (!canManagePost(u, p)) return send(res, 403, { ok: false, msg: '只能审核自己板块的帖子' });
+      if (!p.pending) return send(res, 400, { ok: false, msg: '该帖子已经审核过了' });
+      p.pending = false;
+      // 通过才发经验/计数/热度
+      const author = findUserById(p.userId);
+      if (author) {
+        author.posts = (author.posts || 0) + 1;
+        author.exp = (author.exp || 0) + EXP_POST;
+      }
+      // 审核人：板块主/社区主 +30 经验
+      u.exp = (u.exp || 0) + EXP_AUDIT;
+      // 从待审队列摘掉
+      db.meta.pending = db.meta.pending || {};
+      if (Array.isArray(db.meta.pending[p.boardId])) {
+        db.meta.pending[p.boardId] = db.meta.pending[p.boardId].filter(id => id !== p.id);
+      }
+      dirty = true;
+      console.log('[审核]', u.nickname, body.pass === false ? '驳回' : '通过', p.title);
+      return send(res, 200, {
+        ok: true,
+        msg: (body.pass === false ? '已驳回「' : '已通过「') + p.title + '」 审核经验 +' + EXP_AUDIT,
+      });
+    });
+  }
+
+  /* ---- 板块主头衔：金色 · XX主 ---- */
+  if (method === 'POST' && urlPath === '/api/board/master_title') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      const boardId = String(body.boardId || '');
+      if (!isBoardMaster(u, boardId) && !isAdmin(u))
+        return send(res, 403, { ok: false, msg: '只有该板块的板块主能改头衔' });
+      const t = String(body.title || '').trim().slice(0, TITLE_MAX);
+      u.boardTitles = u.boardTitles || {};
+      if (t) u.boardTitles[boardId] = t;
+      else delete u.boardTitles[boardId];
+      dirty = true;
+      return send(res, 200, { ok: true, msg: t ? '板块主头衔已设为「' + t + '」' : '已恢复默认板块主头衔', data: { title: t } });
     });
   }
 
@@ -676,8 +835,16 @@ const server = http.createServer((req, res) => {
   if (method === 'POST' && urlPath === '/api/admin/music') {
     return readJson(req, (body) => {
       if (!requireAdmin(body, res)) return;
-      // 简化：只控制开关（列表改代码里的 MUSIC_LIST）
-      return send(res, 200, { ok: true, msg: '音乐列表当前 ' + MUSIC_LIST.length + ' 首，开关=' + MUSIC_ENABLED });
+      if (typeof body.enabled === 'boolean') {
+        db.meta.musicEnabled = body.enabled;
+        musicEnabled = body.enabled;
+        dirty = true;
+      }
+      return send(res, 200, {
+        ok: true,
+        msg: '音乐当前 ' + (db.meta.musicEnabled ? '开' : '关') + '，列表 ' + MUSIC_LIST.length + ' 首',
+        data: { enabled: !!db.meta.musicEnabled },
+      });
     });
   }
 
@@ -761,7 +928,11 @@ const server = http.createServer((req, res) => {
         return send(res, 200, { ok: true, msg: p.pinned ? '已置顶' : '已取消置顶' });
       }
       const au = findUserById(p.userId);
-      if (au) au.posts = Math.max(0, (au.posts || 0) - 1);
+      if (au && !p.pending) au.posts = Math.max(0, (au.posts || 0) - 1); // 待审核的还没计数
+      db.meta.pending = db.meta.pending || {};
+      if (Array.isArray(db.meta.pending[p.boardId])) {
+        db.meta.pending[p.boardId] = db.meta.pending[p.boardId].filter(id => id !== p.id);
+      }
       db.posts.splice(db.posts.indexOf(p), 1); dirty = true;
       return send(res, 200, { ok: true, msg: '帖子已删除' });
     });
@@ -917,7 +1088,7 @@ function extractMultipartFile(buf, contentType) {
 
 server.listen(PORT, () => {
   console.log('========================================');
-  console.log('  豆包社区服务器 v2.0 已启动');
+  console.log('  豆包社区服务器 v2.3 已启动');
   console.log('  地址: http://localhost:' + PORT);
   console.log('  用户: ' + db.users.length + ' | 帖子: ' + db.posts.length);
   console.log('========================================');
