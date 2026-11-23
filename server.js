@@ -302,6 +302,7 @@ function postSummary(p, viewer) {
     id: p.id, boardId: p.boardId, title: p.title,
     preview: (p.content || '').slice(0, 120),
     imageCount: (p.images || []).length, firstImage: (p.images || [])[0] || '',
+    videos: p.videos || [],
     userId: p.userId, nickname: p.nickname, avatar: p.avatar || '',
     exp: u ? u.exp || 0 : 0,
     authorTitle: u ? u.title || '' : '',
@@ -639,36 +640,51 @@ const server = http.createServer((req, res) => {
     });
   }
 
-  /* ---- 上传图片 ---- */
+  /* ---- 上传图片 / 视频 / 文件 ---- */
+  const UPLOAD_EXTS = /^\.(png|jpe?g|gif|webp|mp4|3gp|webm|mov|m4v|apk|zip|rar|7z|pdf|doc|docx|xls|xlsx|ppt|pptx|txt|mp3|aac|ogg|json|xml|bin)$/;
   if (method === 'POST' && urlPath === '/api/upload') {
     return readBody(req, (buf, err) => {
-      if (err) return send(res, 413, { ok: false, msg: '文件太大（上限 10MB）' });
+      if (err) return send(res, 413, { ok: false, msg: '文件太大（上限 30MB）' });
       const part = extractMultipartFile(buf, req.headers['content-type'] || '');
       if (!part) return send(res, 400, { ok: false, msg: '上传格式错误' });
-      // 后缀：优先用文件名里的；没有就用 Content-Type 猜；还不行就当 jpg
+      // 后缀：优先用文件名里的；没有就用 Content-Type 猜；仍不支持则拒绝
       let ext = (path.extname(part.filename || '') || '').toLowerCase();
-      if (!/^\.(png|jpe?g|gif|webp)$/.test(ext)) {
+      if (!UPLOAD_EXTS.test(ext)) {
         const ct = (part.contentType || '').toLowerCase();
-        if (ct.includes('png')) ext = '.png';
+        if (ct.includes('mp4') || ct.includes('video')) ext = '.mp4';
+        else if (ct.includes('png')) ext = '.png';
         else if (ct.includes('gif')) ext = '.gif';
         else if (ct.includes('webp')) ext = '.webp';
-        else ext = '.jpg';
+        else if (ct.includes('apk')) ext = '.apk';
+        else if (ct.includes('zip') || ct.includes('compressed')) ext = '.zip';
+        else if (ct.includes('pdf')) ext = '.pdf';
+        else if (ct.includes('text')) ext = '.txt';
+        else ext = '';
       }
+      if (!UPLOAD_EXTS.test(ext)) return send(res, 400, { ok: false, msg: '暂不支持这种文件类型' });
       const name = Date.now().toString(36) + crypto.randomBytes(4).toString('hex') + ext;
       fs.mkdirSync(UPLOAD_DIR, { recursive: true });
       fs.writeFileSync(path.join(UPLOAD_DIR, name), part.body);
       console.log('[上传]', name, part.body.length, 'bytes', part.filename);
       return send(res, 200, { ok: true, msg: '上传成功', data: { url: '/files/' + name } });
-    }, 10 * 1024 * 1024);
+    }, 30 * 1024 * 1024);
   }
 
-  /* ---- 访问图片 ---- */
+  /* ---- 访问图片 / 视频 / 文件 ---- */
   if (method === 'GET' && urlPath.startsWith('/files/')) {
     const name = path.basename(urlPath);
     if (!/^[\w.-]+$/.test(name)) { res.writeHead(404); return res.end('not found'); }
     const file = path.join(UPLOAD_DIR, name);
     if (!fs.existsSync(file)) { res.writeHead(404); return res.end('not found'); }
-    const mimeMap = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
+    const mimeMap = {
+      '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif', '.webp': 'image/webp',
+      '.mp4': 'video/mp4', '.3gp': 'video/3gpp', '.webm': 'video/webm',
+      '.mov': 'video/quicktime', '.m4v': 'video/x-m4v',
+      '.apk': 'application/vnd.android.package-archive',
+      '.zip': 'application/zip', '.rar': 'application/vnd.rar', '.7z': 'application/x-7z-compressed',
+      '.pdf': 'application/pdf', '.txt': 'text/plain', '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg'
+    };
     res.writeHead(200, { 'Content-Type': mimeMap[path.extname(name)] || 'application/octet-stream' });
     return fs.createReadStream(file).pipe(res);
   }
@@ -688,12 +704,17 @@ const server = http.createServer((req, res) => {
       const content = String(body.content || '').trim();
       const boardId = String(body.boardId || '').trim().slice(0, 30);
       const images = Array.isArray(body.images) ? body.images.slice(0, 3).filter(x => /^\/files\/[\w.-]+$/.test(x)) : [];
+      const videos = Array.isArray(body.videos) ? body.videos.slice(0, 1).filter(x => /^\/files\/[\w.-]+$/.test(x)) : [];
+      const files = Array.isArray(body.files) ? body.files.slice(0, 3).filter(f => f && /^\/files\/[\w.-]+$/.test(f.url)).map(f => ({
+        url: String(f.url), name: String(f.name || '附件').slice(0, 60),
+        mime: String(f.mime || ''), size: Number(f.size) || 0,
+      })) : [];
       if (title.length < 1 || title.length > 50) return send(res, 400, { ok: false, msg: '标题要 1-50 个字' });
       if (content.length > 5000) return send(res, 400, { ok: false, msg: '内容太长了（上限5000字）' });
       if (!boardId) return send(res, 400, { ok: false, msg: '缺少板块' });
       const post = {
         id: 'p' + Date.now().toString(36) + crypto.randomBytes(3).toString('hex'),
-        boardId, title, content, images,
+        boardId, title, content, images, videos, files,
         userId: u.id, nickname: u.nickname, avatar: u.avatar || '',
         ts: Date.now(), views: 0, likes: [], comments: [], pinned: false, lastExpDay: null,
         pending: true,          // ★ 默认进待审核区，板块主/社区主审核通过后才对大家展示
@@ -751,7 +772,7 @@ const server = http.createServer((req, res) => {
         data: {
           post: {
             id: p.id, boardId: p.boardId, title: p.title, content: p.content,
-            images: p.images || [], userId: p.userId, nickname: p.nickname,
+            images: p.images || [], videos: p.videos || [], files: p.files || [], userId: p.userId, nickname: p.nickname,
             avatar: p.avatar || '', exp: u ? u.exp || 0 : 0, ts: p.ts,
             views: p.views, likes: (p.likes || []).length,
             collects: (p.collects || []).length, shares: p.shares || 0,
@@ -765,7 +786,7 @@ const server = http.createServer((req, res) => {
             comments: (p.comments || []).map(c => ({
               id: c.id, userId: c.userId, nickname: c.nickname,
               avatar: c.avatar || '', exp: (() => { const cu = findUserById(c.userId); return cu ? cu.exp || 0 : 0; })(),
-              content: c.content, ts: c.ts,
+              content: c.content, images: c.images || [], reply: c.reply || null, ts: c.ts,
             })),
             pinned: !!p.pinned,
           }
@@ -803,15 +824,25 @@ const server = http.createServer((req, res) => {
       const p = db.posts.find(x => x.id === body.id);
       if (!p) return send(res, 404, { ok: false, msg: '帖子不存在' });
       const content = String(body.content || '').trim().slice(0, 1000);
-      if (!content) return send(res, 400, { ok: false, msg: '评论不能为空' });
+      const images = Array.isArray(body.images)
+        ? body.images.filter(x => /^\/files\/[\w.-]+$/.test(x)).slice(0, 1) : [];
+      if (!content && images.length === 0) return send(res, 400, { ok: false, msg: '评论不能为空' });
+      // 回复某条评论
+      let reply = null;
+      const replyToId = String(body.replyToId || '');
+      if (replyToId) {
+        const rc = (p.comments || []).find(c => c.id === replyToId);
+        if (rc) reply = { id: rc.id, nickname: rc.nickname, userId: rc.userId };
+      }
       p.comments = p.comments || [];
       p.comments.push({
         id: 'c' + Date.now().toString(36) + crypto.randomBytes(2).toString('hex'),
         userId: u.id, nickname: u.nickname, avatar: u.avatar || '',
-        content, ts: Date.now(),
+        content, images, reply, ts: Date.now(),
       });
+      const notifyText = content || '发了一张图片';
       notify(p.userId, 'comment', '收到一条评论',
-        u.nickname + ' 评论了《' + (p.title || '') + '》：' + content.slice(0, 40), u, p.id);
+        u.nickname + ' 评论了《' + (p.title || '') + '》：' + notifyText.slice(0, 40), u, p.id);
       // ★ 评论≥15字 +10 经验
       if (content.length >= 15) u.exp = (u.exp || 0) + EXP_COMMENT;
       dirty = true;
@@ -910,10 +941,14 @@ const server = http.createServer((req, res) => {
     return readJson(req, (body) => {
       const q = String(body.q || '').trim().toLowerCase();
       if (!q) return send(res, 200, { ok: true, data: { posts: [], users: [] } });
-      const posts = db.posts.filter(p =>
+      const boardId = String(body.boardId || '').trim();
+      let matched = db.posts.filter(p =>
         (p.title || '').toLowerCase().includes(q) ||
         (p.content || '').toLowerCase().includes(q)
-      ).sort((a, b) => heat(b) - heat(a)).slice(0, 50).map(postSummary);
+      );
+      // 板块内搜索：只在当前板块内检索；不传 boardId 则全局搜索
+      if (boardId) matched = matched.filter(p => p.boardId === boardId);
+      const posts = matched.sort((a, b) => heat(b) - heat(a)).slice(0, 50).map(postSummary);
       const users = db.users.filter(u =>
         (u.nickname || '').toLowerCase().includes(q)
       ).slice(0, 20).map(u => ({
@@ -1630,6 +1665,12 @@ wss.on('connection', (ws) => {
       // ★ 图文混合：content 是配文（可空）
       const content = String(o.content || '').trim().slice(0, 500);
       return pushMsg({ type: 'image', content, url, user, reply: o.reply || null });
+    }
+    if (type === 'video') {
+      const url = String(o.url || '');
+      if (!/^\/files\/[\w.-]+$/.test(url)) return;
+      const content = String(o.content || '').trim().slice(0, 500);
+      return pushMsg({ type: 'video', content, url, user, reply: o.reply || null });
     }
 
     /* ★ v3：撤回消息（2 分钟内，只能撤回自己的） */
