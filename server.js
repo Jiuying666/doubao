@@ -126,6 +126,8 @@ if (db.users.length > 0 && !db.users.some(u => u.id === 100001)) {
   if (!Array.isArray(u.signDays)) u.signDays = [];
   if (typeof u.popularity !== 'number') u.popularity = 0;   // ★ 人气值（收礼物增加）
   if (!u.giftStats || typeof u.giftStats !== 'object') u.giftStats = {}; // ★ 收到的礼物聚合
+  if (!u.giftInventory || typeof u.giftInventory !== 'object') u.giftInventory = {}; // ★ 礼物道具库存
+  if (!Array.isArray(u.giftLogs)) u.giftLogs = [];         // ★ 收到礼物流水（含送礼人）
 });
 if (!db.meta.pending || typeof db.meta.pending !== 'object') db.meta.pending = {};
 if (!Array.isArray(db.moments)) db.moments = [];   // ★ v3 社区动态
@@ -308,6 +310,16 @@ function giftCountOf(u) {
   return giftStatsOf(u).reduce((s, g) => s + g.count, 0);
 }
 
+/** 礼物道具库存 {giftId: count} */
+function inventoryOf(u) {
+  return (u && u.giftInventory) || {};
+}
+
+/** 收到礼物流水（最新在前，最多 200 条） */
+function logsOf(u) {
+  return Array.isArray(u.giftLogs) ? u.giftLogs.slice(0, 200) : [];
+}
+
 function publicUser(u) {
   return {
     id: u.id, nickname: u.nickname, phone: u.phone || '',
@@ -330,6 +342,8 @@ function publicUser(u) {
     popularity: u.popularity || 0,    // ★ 人气值
     giftCount: giftCountOf(u),
     gifts: giftStatsOf(u),
+    giftLogs: logsOf(u),
+    giftInventory: inventoryOf(u),
   };
 }
 
@@ -957,6 +971,7 @@ const server = http.createServer((req, res) => {
             isAdmin: isAdmin(t), banned: !!t.banned,
             title: t.title || '', listVisible: !!t.listVisible,
             popularity: t.popularity || 0, giftCount: giftCountOf(t), gifts: giftStatsOf(t),
+            giftLogs: logsOf(t), giftInventory: inventoryOf(t),
           },
           following: me ? (t.followers || []).includes(me.id) : false,
           posts: myPosts,
@@ -1638,19 +1653,48 @@ const server = http.createServer((req, res) => {
       if (t.id === u.id) return send(res, 400, { ok: false, msg: '不能给自己送礼物哦' });
       const g = GIFT_ITEMS.find(x => x.id === body.giftId);
       if (!g) return send(res, 400, { ok: false, msg: '礼物不存在' });
-      if ((u.coins || 0) < g.price)
-        return send(res, 400, { ok: false, msg: '豆包币不够啦，还差 ' + (g.price - (u.coins || 0)) + ' 个' });
-      u.coins -= g.price;
-      t.popularity = (t.popularity || 0) + g.popularity;
+      let count = Math.floor(Number(body.count) || 1);
+      if (count < 1) count = 1;
+      if (count > 999) return send(res, 400, { ok: false, msg: '一次最多送 999 个礼物' });
+
+      // 优先消耗库存道具，不足部分再扣豆包币
+      u.giftInventory = u.giftInventory || {};
+      const inv = u.giftInventory[g.id] || 0;
+      const useInv = Math.min(inv, count);
+      const needCoin = count - useInv;
+      const coinCost = needCoin * g.price;
+      if ((u.coins || 0) < coinCost)
+        return send(res, 400, { ok: false, msg: '豆包币不够啦，还差 ' + (coinCost - (u.coins || 0)) + ' 个' });
+
+      if (useInv > 0) {
+        u.giftInventory[g.id] = inv - useInv;
+        if (u.giftInventory[g.id] <= 0) delete u.giftInventory[g.id];
+      }
+      u.coins -= coinCost;
+
+      t.popularity = (t.popularity || 0) + g.popularity * count;
       t.giftStats = t.giftStats || {};
       const stat = t.giftStats[g.id] || { name: g.name, emoji: g.emoji, price: g.price, popularity: g.popularity, count: 0 };
-      stat.count += 1;
+      stat.count += count;
       t.giftStats[g.id] = stat;
-      notify(t.id, 'gift', '收到礼物', u.nickname + ' 送了你 ' + g.emoji + ' ' + g.name, u, '');
+
+      // 礼物流水（含送礼人信息），最新在前，最多 200 条
+      t.giftLogs = Array.isArray(t.giftLogs) ? t.giftLogs : [];
+      t.giftLogs.unshift({
+        id: 'gl' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+        giftId: g.id, name: g.name, emoji: g.emoji, price: g.price,
+        popularity: g.popularity, count,
+        fromId: u.id, fromName: u.nickname, fromAvatar: u.avatar || '',
+        ts: Date.now(),
+      });
+      if (t.giftLogs.length > 200) t.giftLogs.length = 200;
+
+      notify(t.id, 'gift', '收到礼物', u.nickname + ' 送了你 ' + g.emoji + ' ' + g.name + ' ×' + count, u, '');
       dirty = true;
-      console.log('[礼物]', u.nickname, '→', t.nickname, g.emoji, g.name);
-      return send(res, 200, { ok: true, msg: '已送出 ' + g.emoji + ' ' + g.name,
-        data: { coins: u.coins, popularity: t.popularity, giftCount: giftCountOf(t), gifts: giftStatsOf(t) } });
+      console.log('[礼物]', u.nickname, '→', t.nickname, g.emoji, g.name, '×' + count);
+      return send(res, 200, { ok: true, msg: '已送出 ' + g.emoji + ' ' + g.name + ' ×' + count,
+        data: { coins: u.coins, inventory: inventoryOf(u), popularity: t.popularity,
+          giftCount: giftCountOf(t), gifts: giftStatsOf(t), giftLogs: logsOf(t) } });
     });
   }
 
@@ -1666,24 +1710,42 @@ const server = http.createServer((req, res) => {
         owned: owned.includes(it.id),
         equipped: itemEquipped(u, it),
       }));
-      return send(res, 200, { ok: true, data: { coins: u.coins || 0, items } });
+      const inv = u.giftInventory || {};
+      const gifts = GIFT_ITEMS.map(g => ({
+        id: g.id, name: g.name, desc: g.emoji + ' 礼物道具，可直接送人', type: 'gift',
+        emoji: g.emoji, price: g.price, popularity: g.popularity, tier: g.tier,
+        stock: inv[g.id] || 0,
+      }));
+      return send(res, 200, { ok: true, data: { coins: u.coins || 0, items, gifts } });
     });
   }
   if (method === 'POST' && urlPath === '/api/shop/buy') {
     return readJson(req, (body) => {
       const u = findUserByToken(body.token);
       if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
-      const item = SHOP_ITEMS.find(x => x.id === body.itemId);
-      if (!item) return send(res, 404, { ok: false, msg: '商品不存在' });
-      u.ownedItems = Array.isArray(u.ownedItems) ? u.ownedItems : [];
-      if (u.ownedItems.includes(item.id))
-        return send(res, 400, { ok: false, msg: '你已经有这个了，直接使用就行' });
-      if ((u.coins || 0) < item.price)
-        return send(res, 400, { ok: false, msg: '豆包币不够啦，还差 ' + (item.price - (u.coins || 0)) + ' 个' });
-      u.coins -= item.price;
-      u.ownedItems.push(item.id);
+      const titleItem = SHOP_ITEMS.find(x => x.id === body.itemId);
+      if (titleItem) {
+        u.ownedItems = Array.isArray(u.ownedItems) ? u.ownedItems : [];
+        if (u.ownedItems.includes(titleItem.id))
+          return send(res, 400, { ok: false, msg: '你已经有这个了，直接使用就行' });
+        if ((u.coins || 0) < titleItem.price)
+          return send(res, 400, { ok: false, msg: '豆包币不够啦，还差 ' + (titleItem.price - (u.coins || 0)) + ' 个' });
+        u.coins -= titleItem.price;
+        u.ownedItems.push(titleItem.id);
+        dirty = true;
+        return send(res, 200, { ok: true, msg: '兑换成功！点「使用」就能换上', data: { coins: u.coins } });
+      }
+      // 礼物道具：买一个入库，可重复购买
+      const gift = GIFT_ITEMS.find(x => x.id === body.itemId);
+      if (!gift) return send(res, 404, { ok: false, msg: '商品不存在' });
+      if ((u.coins || 0) < gift.price)
+        return send(res, 400, { ok: false, msg: '豆包币不够啦，还差 ' + (gift.price - (u.coins || 0)) + ' 个' });
+      u.coins -= gift.price;
+      u.giftInventory = u.giftInventory || {};
+      u.giftInventory[gift.id] = (u.giftInventory[gift.id] || 0) + 1;
       dirty = true;
-      return send(res, 200, { ok: true, msg: '兑换成功！点「使用」就能换上', data: { coins: u.coins } });
+      return send(res, 200, { ok: true, msg: '已购入 ' + gift.emoji + ' ' + gift.name + '，可去送人',
+        data: { coins: u.coins, inventory: inventoryOf(u) } });
     });
   }
   if (method === 'POST' && urlPath === '/api/shop/equip') {
