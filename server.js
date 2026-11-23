@@ -258,6 +258,11 @@ function isBoardMaster(u, boardId) {
 /** 可以管理这个帖子吗？社区主任何帖子都行；板块主只能管自己板块 */
 function canManagePost(u, p) { return isAdmin(u) || isBoardMaster(u, p.boardId); }
 
+/** 实时统计用户帖子数（以 db.posts 为准，避免冗余计数与实际列表脱节） */
+function countUserPosts(userId) {
+  return db.posts.filter(p => p.userId === userId).length;
+}
+
 /** 对外输出的用户信息（不含密码） */
 function publicUser(u) {
   return {
@@ -265,7 +270,7 @@ function publicUser(u) {
     avatar: u.avatar || '', coins: u.coins || 0,
     followers: Array.isArray(u.followers) ? u.followers.length : (u.followers || 0),
     following: Array.isArray(u.following) ? u.following.length : (u.following || 0),
-    posts: u.posts || 0, exp: u.exp || 0,
+    posts: countUserPosts(u.id), exp: u.exp || 0,
     banned: !!u.banned, mutedUntil: u.mutedUntil || 0,
     isAdmin: isAdmin(u), bio: u.bio || '', bg: u.bg || '',
     boards: u.boards || [],
@@ -836,9 +841,9 @@ const server = http.createServer((req, res) => {
       const isSelf = me && me.id === t.id;
       const canSeeList = isSelf || isAdmin(t) || !!t.listVisible; // 默认别人不可见
       // TA 发过的帖子（最新的在前，最多 20 条；待审核的不给别人看）
-      const myPosts = db.posts.filter(p => p.userId === t.id && (!p.pending || (me && (me.id === t.id || canManagePost(me, p)))))
-        .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.ts - a.ts)
-        .slice(0, 20).map(postSummary);
+      const visiblePosts = db.posts.filter(p => p.userId === t.id && (!p.pending || (me && (me.id === t.id || canManagePost(me, p)))))
+        .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.ts - a.ts);
+      const myPosts = visiblePosts.slice(0, 20).map(postSummary);
       const listUser = (x) => {
         const u = findUserById(x);
         return u ? { id: u.id, nickname: u.nickname, avatar: u.avatar || '', exp: u.exp || 0, title: u.title || '' } : null;
@@ -850,7 +855,7 @@ const server = http.createServer((req, res) => {
             id: t.id, nickname: t.nickname, avatar: t.avatar || '',
             bio: t.bio || '', bg: t.bg || '', coins: t.coins || 0,
             followers: t.followers || 0, following: t.following || 0,
-            posts: t.posts || 0, exp: t.exp || 0,
+            posts: visiblePosts.length, exp: t.exp || 0,
             isAdmin: isAdmin(t), banned: !!t.banned,
             title: t.title || '', listVisible: !!t.listVisible,
           },
@@ -913,7 +918,7 @@ const server = http.createServer((req, res) => {
         (u.nickname || '').toLowerCase().includes(q)
       ).slice(0, 20).map(u => ({
         id: u.id, nickname: u.nickname, avatar: u.avatar || '',
-        exp: u.exp || 0, posts: u.posts || 0,
+        exp: u.exp || 0, posts: countUserPosts(u.id),
       }));
       const me = findUserByToken(body.token);
       const moments = (db.moments || []).filter(m =>
@@ -983,7 +988,7 @@ const server = http.createServer((req, res) => {
       );
       const arr = list.map(u => ({
         id: u.id, nickname: u.nickname, avatar: u.avatar || '',
-        coins: u.coins || 0, exp: u.exp || 0, posts: u.posts || 0,
+        coins: u.coins || 0, exp: u.exp || 0, posts: countUserPosts(u.id),
         banned: !!u.banned, mutedUntil: u.mutedUntil || 0,
         isAdmin: isAdmin(u), created: u.created,
         boards: u.boards || [], phone: u.phone || '',
@@ -1469,7 +1474,7 @@ const server = http.createServer((req, res) => {
       const type = String(body.type || 'exp');
       const pick = (u) => ({
         id: u.id, nickname: u.nickname, avatar: u.avatar || '',
-        exp: u.exp || 0, posts: u.posts || 0,
+        exp: u.exp || 0, posts: countUserPosts(u.id),
         followers: Array.isArray(u.followers) ? u.followers.length : (u.followers || 0),
         isAdmin: isAdmin(u),
       });
