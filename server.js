@@ -556,15 +556,15 @@ const server = http.createServer((req, res) => {
       const nickname = String(body.nickname || '').trim();
       const phone = String(body.phone || '').trim();
       const password = String(body.password || '');
+      if (!/^1\d{10}$/.test(phone))
+        return send(res, 400, { ok: false, msg: '请输入正确的 11 位手机号' });
       if (nickname.length < 2 || nickname.length > 12)
         return send(res, 400, { ok: false, msg: '昵称要 2-12 个字' });
       if (password.length < 6)
         return send(res, 400, { ok: false, msg: '密码至少 6 位' });
-      if (phone && !/^1\d{10}$/.test(phone))
-        return send(res, 400, { ok: false, msg: '手机号格式不对' });
       if (db.users.some(u => u.nickname === nickname))
         return send(res, 400, { ok: false, msg: '这个昵称已被占用' });
-      if (phone && db.users.some(u => u.phone === phone))
+      if (db.users.some(u => u.phone === phone))
         return send(res, 400, { ok: false, msg: '这个手机号已注册过' });
 
       const user = {
@@ -597,7 +597,8 @@ const server = http.createServer((req, res) => {
     return readJson(req, (body, err) => {
       if (err) return send(res, 400, { ok: false, msg: '请求格式错误' });
       const account = String(body.account || '').trim();
-      const u = db.users.find(x => x.nickname === account || (x.phone && x.phone === account));
+      // 登录仅支持手机号
+      const u = db.users.find(x => x.phone && x.phone === account);
       if (!u)
         return send(res, 404, { ok: false, msg: '没有此账号，请先注册' });
       if (u.pass !== hashPassword(String(body.password || '')))
