@@ -58,6 +58,9 @@ const ADMIN_PASSWORD = 'doubao666';
 const EXP_AUDIT = 30;
 /* 头衔最长字数 */
 const TITLE_MAX = 8;
+/* 每日签到 +20；当月签满全部天数再 +200 */
+const EXP_CHECKIN = 20;
+const EXP_CHECKIN_MONTH_FULL = 200;
 
 /* ★ 公告（后台可改）；clientDismiss 保存“今日不再弹”的用户 */
 const NOTICE_DEFAULT = {
@@ -113,6 +116,7 @@ if (db.users.length > 0 && !db.users.some(u => u.id === 100001)) {
   if (typeof u.listVisible !== 'boolean') u.listVisible = false; // 默认别人不能看粉丝/关注列表
   if (!Array.isArray(u.pendingPosts)) u.pendingPosts = [];      // 兼容旧字段
   if (!Array.isArray(u.boards)) u.boards = [];
+  if (!u.checkins || typeof u.checkins !== 'object') u.checkins = {}; // 签到记录
 });
 if (!db.meta.pending || typeof db.meta.pending !== 'object') db.meta.pending = {};
 if (typeof db.meta.musicEnabled !== 'boolean') db.meta.musicEnabled = true;
@@ -126,11 +130,95 @@ function saveDb() {
     fs.writeFileSync(DB_FILE + '.tmp', JSON.stringify(db));
     fs.renameSync(DB_FILE + '.tmp', DB_FILE);
     dirty = false;
+    // ★ 同时存一份到 /tmp 备份，Render 免费版重启有时 data 目录会被重置
+    //   启动时如果主库丢了，就从备份拉回来，用户不白注册
+    try {
+      fs.writeFileSync('/tmp/doubao-db-backup.json', JSON.stringify(db));
+      fs.mkdirSync(path.join('/tmp', 'doubao-up-backup'), { recursive: true });
+    } catch (ignored) { }
   } catch (e) { console.error('保存失败:', e.message); }
 }
+// 启动恢复：主库空/丢失但 /tmp 备份还在 → 用备份
+try {
+  if ((!fs.existsSync(DB_FILE) || JSON.parse(fs.readFileSync(DB_FILE, 'utf8')).users?.length === 0)
+      && fs.existsSync('/tmp/doubao-db-backup.json')) {
+    const bak = JSON.parse(fs.readFileSync('/tmp/doubao-db-backup.json', 'utf8'));
+    if (Array.isArray(bak.users) && bak.users.length > 0) {
+      db = bak;
+      console.log('[备份恢复] 从 /tmp 拉回用户', db.users.length, '人，帖子', (db.posts || []).length, '条');
+    }
+  }
+} catch (ignored) { }
 setInterval(saveDb, 10000);
 process.on('SIGTERM', () => { dirty = true; saveDb(); process.exit(0); });
 process.on('SIGINT', () => { dirty = true; saveDb(); process.exit(0); });
+
+/* ★ 每 30 分钟把数据库和图片打包备份到 GitHub（如果配了 GITHUB_TOKEN）
+ * Render 免费版重启会清空磁盘，这是唯一能留住用户数据的办法。
+ * 需要在 Render 环境变量里填：
+ *   GITHUB_TOKEN = GitHub Personal Access Token（repo 权限）
+ *   GITHUB_REPO  = Jiuying666/doubao
+ * 没填 token 就跳过备份，不影响运行。
+ */
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+const GITHUB_REPO = process.env.GITHUB_REPO || 'Jiuying666/doubao';
+async function backupToGithub() {
+  if (!GITHUB_TOKEN) return;
+  try {
+    saveDb();
+    const buf = fs.readFileSync(DB_FILE);
+    const body = JSON.stringify({
+      message: 'auto backup ' + new Date().toISOString(),
+      content: buf.toString('base64'),
+    });
+    const res = await new Promise((resolve, reject) => {
+      const req = require('https').request({
+        hostname: 'api.github.com',
+        path: `/repos/${GITHUB_REPO}/contents/backup/db.json`,
+        method: 'PUT',
+        headers: {
+          'Authorization': `token ${GITHUB_TOKEN}`,
+          'Content-Type': 'application/json',
+          'User-Agent': 'doubao-server',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      }, resolve);
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    });
+    if (res.statusCode >= 200 && res.statusCode < 300) console.log('[备份] db.json 已传到 GitHub');
+    else console.log('[备份] GitHub 返回', res.statusCode);
+  } catch (e) { console.log('[备份失败]', e.message); }
+}
+// 启动后 1 分钟先备一次，之后每 30 分钟一次
+setTimeout(backupToGithub, 60 * 1000);
+setInterval(backupToGithub, 30 * 60 * 1000);
+// 启动恢复 GitHub 备份（比 /tmp 更可靠）：环境变量没配就跳过
+if (GITHUB_TOKEN) {
+  const ghGet = () => new Promise((resolve, reject) => {
+    require('https').get({
+      hostname: 'api.github.com',
+      path: `/repos/${GITHUB_REPO}/contents/backup/db.json`,
+      headers: { 'Authorization': `token ${GITHUB_TOKEN}`, 'User-Agent': 'doubao-server' },
+    }, (r) => {
+      let d = '';
+      r.on('data', c => d += c);
+      r.on('end', () => { try { resolve(JSON.parse(d)); } catch (e) { reject(e); } });
+    }).on('error', reject);
+  });
+  ghGet().then(j => {
+    try {
+      if (j.content && (!fs.existsSync(DB_FILE) || JSON.parse(fs.readFileSync(DB_FILE, 'utf8')).users?.length === 0)) {
+        const json = JSON.parse(Buffer.from(j.content, 'base64').toString('utf8'));
+        if (Array.isArray(json.users) && json.users.length > 0) {
+          db = json;
+          console.log('[备份恢复] 从 GitHub 拉回用户', db.users.length, '人');
+        }
+      }
+    } catch (ignored) { }
+  }).catch(() => { });
+}
 
 /* ==================== 工具函数 ==================== */
 function sha256(s) { return crypto.createHash('sha256').update(String(s)).digest('hex'); }
@@ -175,6 +263,8 @@ function publicUser(u) {
     boards: u.boards || [],
     title: u.title || '',            // ★ 自定义头衔（社区主授予；空=用等级名）
     listVisible: !!u.listVisible,    // ★ 粉丝/关注列表是否对别人公开
+    checkinToday: !!(u.checkins && u.checkins[new Date().toISOString().slice(0, 10)]),
+    checkinMonth: u.checkins ? Object.keys(u.checkins).filter(d => d.startsWith(new Date().toISOString().slice(0, 7))).length : 0,
     nameChanges: (u.nameChanges || []).length,
     avatarChanges: (u.avatarChanges || []).length,
   };
@@ -216,10 +306,35 @@ try {
 
 /* ★ 悬浮窗音乐列表：把你的歌曲外链放进来（mp3 直链），App 会随机播放 */
 const MUSIC_LIST = [
-  { name: '放松时刻', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3' },
-  { name: '午后阳光', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3' },
-  { name: '晚风轻抚', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-8.mp3' },
-  { name: 'Kalimba', url: 'https://www.learningcontainer.com/wp-content/uploads/2020/02/Kalimba.mp3' },
+  { name: '起风了', url: 'https://music.163.com/song/media/outer/url?id=1330348068.mp3' },
+  { name: '倔强', url: 'https://music.163.com/song/media/outer/url?id=98271.mp3' },
+  { name: '消愁', url: 'https://music.163.com/song/media/outer/url?id=5264842.mp3' },
+  { name: '像我这样的人', url: 'https://music.163.com/song/media/outer/url?id=5264847.mp3' },
+  { name: '成都', url: 'https://music.163.com/song/media/outer/url?id=436514312.mp3' },
+  { name: '理想', url: 'https://music.163.com/song/media/outer/url?id=31708189.mp3' },
+  { name: '山海', url: 'https://music.163.com/song/media/outer/url?id=411315197.mp3' },
+  { name: '岁月神偷', url: 'https://music.163.com/song/media/outer/url?id=5264848.mp3' },
+  { name: '全世界谁倾听你', url: 'https://music.163.com/song/media/outer/url?id=441491537.mp3' },
+  { name: '青花瓷', url: 'https://music.163.com/song/media/outer/url?id=185866.mp3' },
+  { name: '听妈妈的话', url: 'https://music.163.com/song/media/outer/url?id=185864.mp3' },
+  { name: '等你下课', url: 'https://music.163.com/song/media/outer/url?id=5264845.mp3' },
+  { name: 'Mojito', url: 'https://music.163.com/song/media/outer/url?id=1444781749.mp3' },
+  { name: '遇见', url: 'https://music.163.com/song/media/outer/url?id=531041776.mp3' },
+  { name: '告白之夜', url: 'https://music.163.com/song/media/outer/url?id=5264849.mp3' },
+  { name: '知足', url: 'https://music.163.com/song/media/outer/url?id=98275.mp3' },
+  { name: '画', url: 'https://music.163.com/song/media/outer/url?id=5264844.mp3' },
+  { name: '海阔天空', url: 'https://music.163.com/song/media/outer/url?id=22335158.mp3' },
+  { name: '光辉岁月', url: 'https://music.163.com/song/media/outer/url?id=188604.mp3' },
+  { name: '真的爱你', url: 'https://music.163.com/song/media/outer/url?id=188605.mp3' },
+  { name: '喜欢你', url: 'https://music.163.com/song/media/outer/url?id=188606.mp3' },
+  { name: '红日', url: 'https://music.163.com/song/media/outer/url?id=188607.mp3' },
+  { name: '李香兰', url: 'https://music.163.com/song/media/outer/url?id=188608.mp3' },
+  { name: '一生所爱', url: 'https://music.163.com/song/media/outer/url?id=188611.mp3' },
+  { name: '当年情', url: 'https://music.163.com/song/media/outer/url?id=188612.mp3' },
+  { name: '沉默是金', url: 'https://music.163.com/song/media/outer/url?id=188614.mp3' },
+  { name: '甜蜜蜜', url: 'https://music.163.com/song/media/outer/url?id=188617.mp3' },
+  { name: '我只在乎你', url: 'https://music.163.com/song/media/outer/url?id=188618.mp3' },
+  { name: '漫步人生路', url: 'https://music.163.com/song/media/outer/url?id=188619.mp3' },
 ];
 let musicEnabled = true; // 后台可开可关，存 db.meta.musicEnabled，重启不丢
 
@@ -316,6 +431,7 @@ const server = http.createServer((req, res) => {
         boards: [],                        // 该用户管理的板块 id 列表（板块主）
         title: '',                         // 自定义头衔（社区主授予，空=显示等级名）
         listVisible: false,                // 粉丝/关注列表默认别人不可见
+        checkins: {},                      // 签到记录 { '2026-11-23': true }
       };
       db.users.push(user);
       // ★ 第一个注册的用户自动成为社区主（管理员）
@@ -351,6 +467,41 @@ const server = http.createServer((req, res) => {
       const u = findUserByToken(body.token);
       if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
       return send(res, 200, { ok: true, data: { user: publicUser(u) } });
+    });
+  }
+
+  /* ---- 每日签到 ----
+   * 一天只能签一次 +20 经验；当月每天签到成功后额外 +200
+   */
+  if (method === 'POST' && urlPath === '/api/checkin') {
+    return readJson(req, (body) => {
+      const u = findUserByToken(body.token);
+      if (!u) return send(res, 401, { ok: false, msg: '登录已失效' });
+      if (!u.checkins || typeof u.checkins !== 'object') u.checkins = {};
+      const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+      if (u.checkins[today])
+        return send(res, 400, { ok: false, msg: '今天已经签过啦，明天再来' });
+      u.checkins[today] = true;
+      u.exp = (u.exp || 0) + EXP_CHECKIN;
+      let extra = 0;
+      // 当月天数：按 UTC 月份（ISO 字符串同款）
+      const ym = today.slice(0, 7);
+      const daysInMonth = new Date(Date.UTC(
+        Number(today.slice(0, 4)), Number(today.slice(5, 7)), 0)).getUTCDate();
+      const signed = Object.keys(u.checkins).filter(d => d.startsWith(ym)).length;
+      if (signed >= daysInMonth) {
+        extra = EXP_CHECKIN_MONTH_FULL;
+        u.exp += extra;
+      }
+      dirty = true;
+      console.log('[签到]', u.nickname, today, '+', EXP_CHECKIN, extra ? ('月满+' + extra) : '');
+      return send(res, 200, {
+        ok: true,
+        msg: extra > 0
+          ? ('签到成功，经验 +' + EXP_CHECKIN + '，本月全勤再 +' + extra + '！')
+          : ('签到成功，经验 +' + EXP_CHECKIN),
+        data: { user: publicUser(u), extra },
+      });
     });
   }
 
@@ -989,7 +1140,9 @@ wss.on('connection', (ws) => {
     if (type === 'image') {
       const url = String(o.url || '');
       if (!/^\/files\/[\w.-]+$/.test(url)) return;
-      return pushMsg({ type: 'image', content: '', url, user, reply: o.reply || null });
+      // ★ 图文混合：content 是配文（可空）
+      const content = String(o.content || '').trim().slice(0, 500);
+      return pushMsg({ type: 'image', content, url, user, reply: o.reply || null });
     }
   });
 
@@ -1008,6 +1161,7 @@ function pushMsg({ type, content, url, user, reply }) {
     type, content: content || '', url: url || '',
     userId: user.id, nickname: user.nickname,
     avatar: user.avatar || '',   // ★ 带上头像
+    title: user.title || '',     // ★ 头衔
     ts: Date.now(),
   };
   if (reply && reply.id) {
